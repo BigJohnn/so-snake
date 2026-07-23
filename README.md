@@ -19,22 +19,56 @@
 
 ## 开发环境
 
-使用 `~/Codes/lerobot/.venv`(uv 管理)。这是唯一齐全的环境:
+优先使用仓库内最小环境。它只安装离线 Gate 需要的依赖,方便迁移到新机器或 macOS;
+硬件采集/训练再切到 lerobot 环境。
 
 ```bash
-/home/hanyu/Codes/lerobot/.venv/bin/python scripts/check_kinematics.py
+# 推荐: uv
+uv venv .venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# 没有 uv 时
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e ".[dev]"
+
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q
+PYTHONPATH=src scripts/check_teleop_loop.py --steps 300
 ```
 
-| 依赖 | 版本 | 用途 |
-|---|---|---|
-| lerobot | 0.4.5 (editable) | 机器人驱动、遥操作、数据集、训练框架 |
-| placo | 0.9.16 | 独立 FK 交叉验证 |
-| feetech-servo-sdk | 1.0.0 | STS3215 舵机通讯 |
-| hidapi | 0.14.0.post4 | Pro 手柄读取 |
-| torch | 2.10.0 | — |
-| mujoco | 3.6 | URDF/STL 仿真、解析 Jacobian 交叉验证、离屏相机 |
+最小环境只保证这些离线路径:
 
-> conda `base` 缺 placo / feetech-servo-sdk;conda `lerobot` env 是 0.4.1 老版本且缺得更多。不要用。
+| 依赖 | 来源 | 用途 |
+|---|---|---|
+| numpy | base dependency | FK/Jacobian/5D IK/atlas/Mock 闭环 |
+| pytest | `.[dev]` | Gate A/B 与 Mock 闭环测试 |
+
+可选能力按需安装,不要让它们阻塞最小环境:
+
+```bash
+uv pip install -e ".[dev,sim]"   # MuJoCo 仿真/离屏相机
+```
+
+| 依赖 | 安装层 | 用途 |
+|---|---|---|
+| mujoco | `.[sim]` | URDF/STL 仿真、解析 Jacobian 交叉验证、离屏相机 |
+| placo | lab/lerobot 环境 | 独立 FK 交叉验证 |
+| lerobot | lab/lerobot 环境 | SOFollower、NintendoTeleop、LeRobotDataset、训练 |
+| feetech-servo-sdk | lab/lerobot 环境 | STS3215 舵机通讯 |
+| hidapi | lab/lerobot 环境 | Pro 手柄读取 |
+| torch | lab/lerobot 环境 | 训练 |
+
+`~/Codes/lerobot/.venv` 仍是当前硬件/数据采集的完整环境,但不应作为跑本仓库离线
+测试的前置条件:
+
+```bash
+/home/hanyu/Codes/lerobot/.venv/bin/python scripts/check_kinematics_agreement.py
+```
+
+注意:系统环境里可能有 ROS pytest 插件,会在缺依赖或 hook 不匹配时污染测试收集。
+本仓库 Gate 使用 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q`。
 
 ## 与 lerobot 的关系
 

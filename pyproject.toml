@@ -9,12 +9,11 @@ description = "Active-perception pick-and-place on the SO-ARM100 (SO-100)"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24"]
 
-# lerobot and placo are expected to be already present in the interpreter --
-# development runs against ~/Codes/lerobot/.venv, which has both. They are not
-# declared as dependencies because pinning them here would fight that checkout.
-
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+sim = ["mujoco>=3.2,<4"]
+# Hardware/data collection still depends on the lerobot checkout used in the lab.
+# Keep it out of the minimal install so the offline gates work on macOS and fresh machines.
 
 [tool.setuptools.packages.find]
 where = ["src"]
