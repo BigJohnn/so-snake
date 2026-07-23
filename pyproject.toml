@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so-snake"
+version = "0.1.0"
+description = "Active-perception pick-and-place on the SO-ARM100 (SO-100)"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+# lerobot and placo are expected to be already present in the interpreter --
+# development runs against ~/Codes/lerobot/.venv, which has both. They are not
+# declared as dependencies because pinning them here would fight that checkout.
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests", "scripts"]

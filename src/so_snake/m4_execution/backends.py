@@ -1,0 +1,168 @@
+"""M4 — the execution module: whatever actually receives joint commands.
+
+Two backends behind one interface, so the control loop above is identical
+offline and on hardware:
+
+  MockFollower       servo model with first-order lag and hard limits, no hardware
+  SOFollowerBackend  lerobot's Feetech STS3215 driver on the real SO-100
+
+The mock is not a physics simulation and does not pretend to be. It exists to
+exercise the parts of the pipeline that break for boring reasons -- wrong joint
+order, wrong units, a stale observation feeding back into IK, a control loop
+that silently runs at 4 Hz -- which is where Phase 0 time actually goes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
+
+import numpy as np
+
+from ..config import ArmConfig, GRIPPER_JOINT, TeleopConfig
+
+
+@runtime_checkable
+class RobotBackend(Protocol):
+    """Minimal joint-space interface the teleoperation loop depends on."""
+
+    @property
+    def joint_names(self) -> tuple[str, ...]:
+        """Arm joints followed by the gripper."""
+        ...
+
+    def connect(self) -> None: ...
+
+    def disconnect(self) -> None: ...
+
+    @property
+    def is_connected(self) -> bool: ...
+
+    def read_joints_deg(self) -> np.ndarray:
+        """Measured positions, in `joint_names` order."""
+        ...
+
+    def write_joints_deg(self, target_deg: np.ndarray) -> None:
+        """Command positions, in `joint_names` order."""
+        ...
+
+
+@dataclass
+class MockFollower:
+    """A servo model good enough to catch integration bugs, and nothing more.
+
+    Each joint tracks its target as a first-order lag, which reproduces the one
+    property of real servos that most often breaks a naive control loop: the
+    measurement fed back into IK is *behind* the command, so a loop that seeds
+    IK from the measurement and assumes it arrived converges differently than
+    one that seeds from the last command.
+    """
+
+    arm: ArmConfig = field(default_factory=ArmConfig)
+
+    # Fraction of the remaining error covered per control step. 1.0 is a
+    # perfect instantaneous servo; the STS3215 under a light load at 30 Hz is
+    # nearer 0.35, which is the default here.
+    tracking_gain: float = 0.35
+    # Standard deviation of the position read-back noise, in degrees. The
+    # STS3215's 12-bit encoder over its 360 deg range quantises at ~0.088 deg.
+    read_noise_deg: float = 0.05
+    initial_joints_deg: np.ndarray | None = None
+    seed: int = 0
+
+    _position: np.ndarray = field(init=False)
+    _connected: bool = field(default=False, init=False)
+    _rng: np.random.Generator = field(init=False)
+    write_count: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        self._rng = np.random.default_rng(self.seed)
+        if self.initial_joints_deg is not None:
+            self._position = np.asarray(self.initial_joints_deg, float).copy()
+        else:
+            # Start at the teleoperation home configuration. Mid-range joints
+            # would seem the neutral choice but put the TCP 65 mm outside the
+            # workspace box, so every run began with the arm travelling back in
+            # and a large transient tracking error that looked like an IK fault.
+            teleop = TeleopConfig()
+            gripper_mid = sum(self.arm.joint_limits_deg[GRIPPER_JOINT]) / 2.0
+            self._position = np.array([*teleop.home_joints_deg, gripper_mid], dtype=float)
+        self._lo = np.array([self.arm.joint_limits_deg[j][0] for j in self.joint_names])
+        self._hi = np.array([self.arm.joint_limits_deg[j][1] for j in self.joint_names])
+
+    @property
+    def joint_names(self) -> tuple[str, ...]:
+        return (*self.arm.joint_names, GRIPPER_JOINT)
+
+    def connect(self) -> None:
+        self._connected = True
+
+    def disconnect(self) -> None:
+        self._connected = False
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    def _require_connection(self) -> None:
+        if not self._connected:
+            raise RuntimeError("MockFollower is not connected; call connect() first")
+
+    def read_joints_deg(self) -> np.ndarray:
+        self._require_connection()
+        noise = self._rng.normal(0.0, self.read_noise_deg, size=self._position.shape)
+        return np.clip(self._position + noise, self._lo, self._hi)
+
+    def write_joints_deg(self, target_deg: np.ndarray) -> None:
+        self._require_connection()
+        target = np.clip(np.asarray(target_deg, float), self._lo, self._hi)
+        if target.shape != self._position.shape:
+            raise ValueError(
+                f"expected {self._position.shape[0]} joint values in order {self.joint_names}, "
+                f"got shape {target.shape}"
+            )
+        self._position = self._position + self.tracking_gain * (target - self._position)
+        self.write_count += 1
+
+    def true_joints_deg(self) -> np.ndarray:
+        """Noise-free state. Available on the mock only, for test assertions."""
+        return self._position.copy()
+
+
+class SOFollowerBackend:
+    """The real SO-100, via lerobot's `SOFollower`.
+
+    Untested against hardware -- the arm has not been connected yet. The port
+    and calibration must be established on the physical robot before this is
+    trusted; see the "on-hardware" checklist in the README.
+    """
+
+    def __init__(self, port: str, arm: ArmConfig | None = None, robot_id: str = "so_snake") -> None:
+        from lerobot.robots.so_follower import SOFollower, SOFollowerConfig
+
+        self.arm = arm or ArmConfig()
+        self._config = SOFollowerConfig(port=port, id=robot_id)
+        self._robot = SOFollower(self._config)
+
+    @property
+    def joint_names(self) -> tuple[str, ...]:
+        return (*self.arm.joint_names, GRIPPER_JOINT)
+
+    def connect(self) -> None:
+        self._robot.connect()
+
+    def disconnect(self) -> None:
+        self._robot.disconnect()
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self._robot.is_connected)
+
+    def read_joints_deg(self) -> np.ndarray:
+        obs = self._robot.get_observation()
+        return np.array([obs[f"{name}.pos"] for name in self.joint_names], dtype=float)
+
+    def write_joints_deg(self, target_deg: np.ndarray) -> None:
+        target = np.asarray(target_deg, float)
+        action = {f"{name}.pos": float(v) for name, v in zip(self.joint_names, target, strict=True)}
+        self._robot.send_action(action)

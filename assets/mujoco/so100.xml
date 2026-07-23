@@ -1,0 +1,92 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="so100_snake">
+  <compiler angle="radian" meshdir="../urdf/so100" />
+  <asset>
+    <mesh name="Base" content_type="model/stl" file="assets/Base.stl" />
+    <mesh name="Base_Motor" content_type="model/stl" file="assets/Base_Motor.stl" />
+    <mesh name="Rotation_Pitch" content_type="model/stl" file="assets/Rotation_Pitch.stl" />
+    <mesh name="Rotation_Pitch_Motor" content_type="model/stl" file="assets/Rotation_Pitch_Motor.stl" />
+    <mesh name="Upper_Arm" content_type="model/stl" file="assets/Upper_Arm.stl" />
+    <mesh name="Upper_Arm_Motor" content_type="model/stl" file="assets/Upper_Arm_Motor.stl" />
+    <mesh name="Lower_Arm" content_type="model/stl" file="assets/Lower_Arm.stl" />
+    <mesh name="Lower_Arm_Motor" content_type="model/stl" file="assets/Lower_Arm_Motor.stl" />
+    <mesh name="Wrist_Pitch_Roll" content_type="model/stl" file="assets/Wrist_Pitch_Roll.stl" />
+    <mesh name="Wrist_Pitch_Roll_Motor" content_type="model/stl" file="assets/Wrist_Pitch_Roll_Motor.stl" />
+    <mesh name="Fixed_Jaw" content_type="model/stl" file="assets/Fixed_Jaw.stl" />
+    <mesh name="Fixed_Jaw_Motor" content_type="model/stl" file="assets/Fixed_Jaw_Motor.stl" />
+    <mesh name="Moving_Jaw" content_type="model/stl" file="assets/Moving_Jaw.stl" />
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.24 0.26 0.29" rgb2="0.28 0.30 0.33" width="300" height="300" />
+    <material name="table" texture="grid" texrepeat="8 8" reflectance="0.05" />
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.16 0.18 0.22" rgb2="0.04 0.05 0.07" width="256" height="256" />
+  </asset>
+  <worldbody>
+    <body name="base" quat="0.707106781 0 0 0.707106781">
+      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01" />
+      <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Base" />
+      <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" mesh="Base_Motor" />
+      <geom type="mesh" rgba="0.1 0.1 0.1 1" mesh="Base" />
+      <body name="shoulder" pos="0 -0.0452 0.0165" quat="0.707109 0.707105 0 0">
+        <inertial pos="-9.07886e-05 0.0590972 0.031089" mass="0.119226" diaginertia="5.94278e-05 5.89975e-05 3.13712e-05" />
+        <joint name="shoulder_pan" pos="0 0 0" axis="0 1 0" range="-2 2" actuatorfrcrange="-35 35" />
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Rotation_Pitch" />
+        <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" mesh="Rotation_Pitch_Motor" />
+        <geom type="mesh" rgba="0.1 0.1 0.1 1" mesh="Rotation_Pitch" />
+        <body name="upper_arm" pos="0 0.1025 0.0306" quat="0.62161 -0.783327 0 0">
+          <inertial pos="-1.72052e-05 0.0701802 0.00310545" mass="0.162409" diaginertia="0.000213312 0.000167164 7.01522e-05" />
+          <joint name="shoulder_lift" pos="0 0 0" axis="1 0 0" range="0 3.5" actuatorfrcrange="-35 35" />
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Upper_Arm" />
+          <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" mesh="Upper_Arm_Motor" />
+          <geom type="mesh" rgba="0.1 0.1 0.1 1" mesh="Upper_Arm" />
+          <body name="lower_arm" pos="0 0.11257 0.028" quat="0.707109 0.707105 0 0">
+            <inertial pos="-0.00339604 0.00137796 0.0768007" mass="0.147968" diaginertia="0.000138803 0.000107748 4.84242e-05" />
+            <joint name="elbow_flex" pos="0 0 0" axis="1 0 0" range="-3.14158 0" actuatorfrcrange="-35 35" />
+            <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Lower_Arm" />
+            <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" mesh="Lower_Arm_Motor" />
+            <geom type="mesh" rgba="0.1 0.1 0.1 1" mesh="Lower_Arm" />
+            <body name="wrist" pos="0 0.0052 0.1349" quat="0.877583 -0.479426 0 0">
+              <inertial pos="-0.00852653 -0.0352279 -2.34622e-05" mass="0.0661321" diaginertia="3.45403e-05 2.39041e-05 1.94704e-05" />
+              <joint name="wrist_flex" pos="0 0 0" axis="1 0 0" range="-2.5 1.2" actuatorfrcrange="-35 35" />
+              <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Wrist_Pitch_Roll" />
+              <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" mesh="Wrist_Pitch_Roll_Motor" />
+              <geom type="mesh" rgba="0.1 0.1 0.1 1" mesh="Wrist_Pitch_Roll" />
+              <body name="gripper" pos="0 -0.0601 0" quat="0.707109 0 0.707105 0">
+                <inertial pos="0.00552377 -0.0280167 0.000483583" mass="0.0929859" diaginertia="5.03136e-05 4.64098e-05 2.72961e-05" />
+                <joint name="wrist_roll" pos="0 0 0" axis="0 1 0" range="-3.14158 3.14158" actuatorfrcrange="-35 35" />
+                <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Fixed_Jaw" />
+                <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.1 0.1 0.1 1" mesh="Fixed_Jaw_Motor" />
+                <body name="jaw" pos="-0.0202 -0.0244 0" quat="6.32679e-06 0 1 0">
+                  <inertial pos="-0.00161745 -0.0303473 0.000449646" mass="0.0202444" diaginertia="1.11265e-05 8.99651e-06 2.99548e-06" />
+                  <joint name="gripper" pos="0 0 0" axis="0 0 1" range="-0.2 2" actuatorfrcrange="-35 35" />
+                  <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0.82 0.12 1" mesh="Moving_Jaw" />
+                </body>
+                <body name="gripper_frame_link" pos="0.0079 -0.099127 -0.000218" quat="0.707105 0.707108 0 0">
+                  <inertial pos="0 0 0" mass="1e-09" diaginertia="0 0 0" />
+                </body>
+                <site name="tcp" pos="0.0079 -0.099127 -0.000218" quat="0.707105483 0.70710808 0 0" size="0.004" rgba="1 0.2 0.2 1" group="3" />
+                <site name="tool" pos="0.0079 -0.099127 -0.000218" quat="4.47371957e-06 -0.707106781 0.707106781 -4.47371957e-06" size="0.004" rgba="0.2 1 0.2 1" group="3" />
+                <camera name="wrist" pos="0.0 0.03 0.035" xyaxes="-1 0 0 0 0 1" fovy="75.0" />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <camera name="third_person" pos="0.62 -0.52 0.45" mode="targetbody" target="base" fovy="45.0" />
+    <geom name="table" type="plane" size="1.5 1.5 0.01" material="table" contype="0" conaffinity="0" group="2" />
+    <light name="key" pos="0.4 -0.6 1.2" dir="-0.2 0.4 -1" directional="true" diffuse="0.7 0.7 0.7" />
+    <light name="fill" pos="-0.4 0.6 0.9" dir="0.3 -0.4 -1" directional="true" diffuse="0.25 0.25 0.28" />
+  </worldbody>
+  <visual>
+    <global offwidth="1280" offheight="960" />
+  </visual>
+  <contact>
+    <exclude body1="base" body2="shoulder" />
+    <exclude body1="shoulder" body2="upper_arm" />
+    <exclude body1="upper_arm" body2="lower_arm" />
+    <exclude body1="lower_arm" body2="wrist" />
+    <exclude body1="wrist" body2="gripper" />
+  </contact>
+  <keyframe>
+    <key name="home" qpos="0 1.22173048 -1.22173048 0.523598776 0 0.899979029" />
+  </keyframe>
+</mujoco>
