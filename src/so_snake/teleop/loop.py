@@ -244,6 +244,8 @@ class TeleopLoop:
             update = self.tracker.approach(retarget.target)
 
             target = update.pose
+            if update.any_clamped:
+                self.retargeter.sync_target(target)
             atlas_pitch_clamped = False
             atlas_roll_infeasible = False
             if self.atlas is not None:
@@ -255,6 +257,8 @@ class TeleopLoop:
                 # step integrates from something reachable rather than from a
                 # request that was silently overruled.
                 self.tracker.pose = target
+                if projection.any_clamped:
+                    self.retargeter.sync_target(target)
 
             # Seed from the last command, not the measurement: the servo lags,
             # so seeding from where it currently is drags the solution backwards

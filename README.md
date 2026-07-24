@@ -99,7 +99,7 @@ Mock 后端离线验证整条链路,回家把后端切成真机即可。
 - [x] MuJoCo 3.6 仿真模型 + 三方运动学互校(ArmChain / placo / MuJoCo)
 - [x] Gate A/B 与默认闭环 desk check: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q` 34 passed; `scripts/check_teleop_loop.py --steps 300` PASS
 - [ ] 双相机采集 + LeRobotDataset 落盘
-- [ ] **回家实测**:舵机 ID/标定、TCP 实测校准、相机外参、clutch 手感调参
+- [ ] **待实测**:舵机 ID/标定、TCP 实测校准、相机外参、clutch 手感调参
 
 ### 5 维任务空间迁移
 

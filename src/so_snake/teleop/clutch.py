@@ -77,6 +77,10 @@ class ClutchRetargeter:
         self._latched = None
         self._was_engaged = False
 
+    def sync_target(self, pose: SO100TaskPose) -> None:
+        """Adopt a downstream-clamped target without changing the clutch latch."""
+        self._target = pose
+
     def force_target(self, pose: SO100TaskPose, sample: NintendoProSample | None = None) -> None:
         """Re-anchor teleop after a downstream safety hold.
 

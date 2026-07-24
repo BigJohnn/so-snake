@@ -190,6 +190,22 @@ class TestTeleopLoop:
 
         assert stats.summary()["steps"] == 5
 
+    def test_reverses_immediately_after_holding_against_workspace_wall(self, ik: TaskIK5D) -> None:
+        samples = [sample(left=(0.0, 1.0)) for _ in range(60)]
+        samples.extend(sample(left=(0.0, 1.0)) for _ in range(20))
+        samples.append(sample(left=(0.0, -1.0)))
+        loop = make_loop(ScriptedSource(samples=samples), ik, read_noise_deg=0.0)
+
+        records = loop.run(realtime=False).records
+        before_reverse = records[-2]
+        reverse = records[-1]
+        x_max = loop.config.limits.pos_max_m[0]
+
+        assert before_reverse.workspace_clamped
+        assert before_reverse.task_target[0] == pytest.approx(x_max)
+        assert reverse.task_target[0] < before_reverse.task_target[0]
+        assert not reverse.workspace_clamped
+
     def test_holds_position_while_the_clutch_is_released(self, ik: TaskIK5D) -> None:
         samples = [sample(left=(1.0, 1.0), right=(0.0, 1.0), clutch=False) for _ in range(20)]
         source = ScriptedSource(samples=samples)
