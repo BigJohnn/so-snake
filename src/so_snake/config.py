@@ -109,15 +109,17 @@ class TaskLimits:
     # From `scripts/map_workspace.py`, which grids the box and solves
     # position-only IK at every point. The largest fully-reachable box, forced
     # symmetric about y = 0 because the arm is, measured 11.84 litres at
-    # x [0.164, 0.380], y [-0.215, 0.215], z [0.074, 0.202]. These pull in from
-    # that by roughly one grid cell, since the map's resolution is not a safety
-    # margin and hardware calibration will shift the true reachable set.
+    # x [0.164, 0.380], y [-0.215, 0.215], z [0.074, 0.202]. The original 80 mm
+    # TCP floor was too conservative in MuJoCo teleop: the gripper mesh still
+    # had about 72 mm table clearance when the task target was already clamped.
+    # Keep the coarse task box usable and let min_robot_mesh_z_m provide the
+    # geometric table clearance check.
     #
     # joycon-robotics' inherited box -- x [0.125, 0.380], y [-0.4, 0.4],
     # z [0.046, 0.23] -- is not to be used even as a coarse filter: it measured
     # 84% reachable, and its |y| <= 0.4 m is geometrically impossible, since the
     # TCP sweeps a circle of radius 0.310 m about the shoulder_pan axis.
-    pos_min_m: tuple[float, float, float] = (0.170, -0.200, 0.080)
+    pos_min_m: tuple[float, float, float] = (0.170, -0.200, 0.004)
     pos_max_m: tuple[float, float, float] = (0.360, 0.200, 0.200)
 
     # Elevation of the gripper's approach axis, positive up. Unlike the deleted
@@ -227,14 +229,18 @@ class TeleopConfig:
     # space has no such failure mode -- forward kinematics of any in-limit
     # configuration is reachable by construction.
     #
-    # These values put the TCP 2.1 mm from the centre of the workspace box with
-    # the gripper angled downward. Verified by tests/test_config.py.
+    # These values put the TCP near the middle of the practical teleop box with
+    # the gripper angled downward.
     home_joints_deg: tuple[float, float, float, float, float] = (0.0, 70.0, -70.0, 30.0, 0.0)
 
     # Per-axis translation gain applied to the controller's normalised input,
     # in metres per control step. joycon-robotics integrates 1 mm per tick at
     # unit dof_speed; at 30 Hz that is 30 mm/s, which is deliberately slow.
     translation_step_m: tuple[float, float, float] = (0.0015, 0.0015, 0.0015)
+
+    # Extra gain for manual translation. The left stick drives table-plane X/Y;
+    # the right stick's vertical axis drives Z.
+    stick_translation_gain: float = 5.0
 
     # Gain on the operator's projected rotation, applied to the `(pitch, roll)`
     # deltas that come out of `OrientationProjector`. Dimensionless: 1.0 means
@@ -254,6 +260,11 @@ class TeleopConfig:
     # step is 180 deg/s, comfortably under the STS3215's free-running speed
     # while still being fast enough that teleop does not feel sluggish.
     max_joint_step_deg: float = 6.0
+
+    # MuJoCo-only geometric table clearance: the lowest moving robot mesh point
+    # must stay this far above the table plane. TCP/tool z alone is not enough:
+    # with some wrist pitches the jaw or wrist body can sit below the tool frame.
+    min_robot_mesh_z_m: float = 0.025
 
     gripper_open_deg: float = 90.0
     gripper_closed_deg: float = 2.0

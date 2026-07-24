@@ -7,6 +7,7 @@ import pytest
 
 from so_snake.config import ArmConfig, SoSnakeConfig
 from so_snake.m3_safety import TaskIK5D
+from so_snake.m3_safety.ik5d import IK5DResult
 from so_snake.m4_execution import MockFollower
 from so_snake.teleop import NintendoProSample, ScriptedSource, TeleopLoop
 
@@ -105,7 +106,7 @@ class TestTeleopLoop:
         assert loop.backend.write_count == 200
 
     def test_tracks_default_5d_waveform_tightly(self, ik: TaskIK5D) -> None:
-        source = ScriptedSource.from_waveform(n_steps=300, amplitude=1.0)
+        source = ScriptedSource.from_waveform(n_steps=300, amplitude=0.2)
         loop = make_loop(source, ik, read_noise_deg=0.0)
 
         summary = loop.run(realtime=False).summary()
@@ -213,6 +214,71 @@ class TestTeleopLoop:
 
         assert grips[0] == pytest.approx(teleop.gripper_open_deg)
         assert grips[1] == pytest.approx(teleop.gripper_closed_deg)
+
+    def test_holds_previous_command_when_post_rate_pose_falls_below_workspace_floor(
+        self, ik: TaskIK5D, monkeypatch
+    ) -> None:
+        source = ScriptedSource(samples=[sample(clutch=True)])
+        loop = make_loop(source, ik, read_noise_deg=0.0)
+        unsafe_joints = np.array([0.0, 0.0, -180.0, -143.24, 0.0])
+        unsafe_pose = ik.task_pose(unsafe_joints).pose
+        assert unsafe_pose.z < SoSnakeConfig().limits.pos_min_m[2], "test command must be below the floor"
+
+        def unsafe_solve(seed, target, *, rate_reference_deg=None, rate_limit=True):
+            del seed, target, rate_reference_deg, rate_limit
+            T = ik.forward(unsafe_joints)
+            return IK5DResult(
+                joints_deg=unsafe_joints.copy(),
+                raw_joints_deg=unsafe_joints.copy(),
+                achieved=unsafe_pose,
+                achieved_yaw_rad=0.0,
+                achieved_yaw_residual_rad=0.0,
+                achieved_pose_world=T,
+                position_error_m=0.0,
+                pitch_error_rad=0.0,
+                roll_error_rad=0.0,
+                iterations=1,
+                converged=False,
+                solver_converged=False,
+                min_singular_value=0.0,
+                damping=0.0,
+                limit_clamped=np.zeros(5, dtype=bool),
+                rate_clamped=np.ones(5, dtype=bool),
+            )
+
+        monkeypatch.setattr(loop.ik, "solve", unsafe_solve)
+        record = loop.run(realtime=False).records[0]
+
+        assert record.command_safety_held
+        assert record.command_safety_reason == "post_rate_achieved_z_below_workspace_floor"
+        assert record.achieved_position[2] >= loop.config.limits.pos_min_m[2]
+        assert np.allclose(record.commanded_joints_deg, loop.config.teleop.home_joints_deg, atol=0.2)
+
+    def test_holds_previous_command_when_candidate_mesh_is_too_low(self, ik: TaskIK5D) -> None:
+        source = ScriptedSource(samples=[sample(clutch=True, left=(0.0, 1.0))])
+        loop = make_loop(source, ik, read_noise_deg=0.0)
+
+        def low_mesh(_target_deg):
+            return 0.010, "jaw"
+
+        loop.backend.command_robot_mesh_min_z_deg = low_mesh
+        record = loop.run(realtime=False).records[0]
+
+        assert record.command_safety_held
+        assert record.command_safety_reason == "post_rate_robot_mesh_below_clearance:jaw:0.0100"
+        assert record.robot_mesh_min_z_m == pytest.approx(0.010)
+        assert record.robot_mesh_min_body == "jaw"
+        assert np.allclose(record.commanded_joints_deg, loop.config.teleop.home_joints_deg, atol=0.2)
+
+    def test_stick_translation_gain_is_five_times_xyz(self, ik: TaskIK5D) -> None:
+        left = sample(left=(-1.0, -1.0), right=(0.0, -1.0))
+        loop = make_loop(ScriptedSource(samples=[left]), ik, read_noise_deg=0.0)
+
+        record = loop.run(realtime=False).records[0]
+        step = np.asarray(loop.config.teleop.translation_step_m)
+        gain = loop.config.teleop.stick_translation_gain
+
+        assert record.task_delta[:3] == pytest.approx(np.array([-gain * step[0], gain * step[1], -gain * step[2]]))
 
     def test_records_all_three_action_streams(self, ik: TaskIK5D) -> None:
         loop = make_loop(ScriptedSource(samples=[sample(left=(0.0, 1.0), gripper=0.25)]), ik)

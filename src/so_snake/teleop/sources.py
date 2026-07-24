@@ -38,7 +38,11 @@ layer, which does support `NintendoController.PRO`, and keep joycon-robotics'
 
 from __future__ import annotations
 
+import os
+import struct
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 import numpy as np
@@ -201,18 +205,95 @@ class ScriptedSource:
         return cls(samples=samples)
 
 
+class NintendoImuEventReader:
+    """Linux hid-nintendo IMU reader for Pro Controller gyro events."""
+
+    EVENT_FORMAT = "llHHi"
+    EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+    EV_ABS = 0x03
+    ABS_RX = 0x03
+    ABS_RY = 0x04
+    ABS_RZ = 0x05
+    GYRO_UNITS_PER_DPS = 14247.0
+
+    def __init__(self, path: str | None = None) -> None:
+        self.path = path or self._find_event_path()
+        self._fd: int | None = None
+        self._values = np.zeros(3, dtype=float)
+
+    @staticmethod
+    def _find_event_path() -> str | None:
+        try:
+            text = Path("/proc/bus/input/devices").read_text()
+        except OSError:
+            return None
+        blocks = text.split("\n\n")
+        for block in blocks:
+            if 'Name="Nintendo Switch Pro Controller IMU"' not in block:
+                continue
+            for line in block.splitlines():
+                if not line.startswith("H: Handlers="):
+                    continue
+                for token in line.removeprefix("H: Handlers=").split():
+                    if token.startswith("event"):
+                        return f"/dev/input/{token}"
+        return None
+
+    def connect(self) -> None:
+        if self.path is None or self._fd is not None:
+            return
+        try:
+            self._fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            self._fd = None
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    @property
+    def is_available(self) -> bool:
+        return self._fd is not None
+
+    def read_gyro_dps(self) -> np.ndarray | None:
+        if self._fd is None:
+            return None
+        while True:
+            try:
+                data = os.read(self._fd, self.EVENT_SIZE * 64)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.close()
+                return None
+            if not data:
+                break
+            usable = len(data) // self.EVENT_SIZE * self.EVENT_SIZE
+            for i in range(0, usable, self.EVENT_SIZE):
+                _sec, _usec, ev_type, code, value = struct.unpack(
+                    self.EVENT_FORMAT,
+                    data[i : i + self.EVENT_SIZE],
+                )
+                if ev_type != self.EV_ABS:
+                    continue
+                if code == self.ABS_RX:
+                    self._values[0] = value
+                elif code == self.ABS_RY:
+                    self._values[1] = value
+                elif code == self.ABS_RZ:
+                    self._values[2] = value
+        return self._values / self.GYRO_UNITS_PER_DPS
+
+
 class NintendoProSource:
     """The Switch Pro controller, via lerobot's `NintendoTeleop`.
 
-    Untested against hardware — the controller has not been connected yet.
-
-    lerobot reports translation and rotation already scaled into metres and
-    radians by its own `translation_scale` / `rotation_scale`, and reports
-    orientation as a rotation vector rather than a quaternion. Both are undone
-    here so that what leaves this class is what the device measured: the gain
-    belongs in `TeleopConfig`, next to the rest of the loop's tuning, and the
-    attitude belongs in the one representation that does not depend on a
-    convention we would have to remember.
+    lerobot is still responsible for opening and initializing the HID device.
+    The sample emitted here is deliberately closer to the raw device frame than
+    lerobot's FR3-style action: `ZL` is the clutch, sticks are raw deflections,
+    and the gyro-derived rotation is accumulated into the quaternion expected by
+    `ClutchRetargeter`.
     """
 
     def __init__(self, controller: str = "pro", device_id: int | None = None) -> None:
@@ -225,15 +306,20 @@ class NintendoProSource:
             enable_rotation=True,
         )
         self._teleop = NintendoTeleop(self._config)
-        self._translation_scale = self._config.translation_scale
         self._rotation_scale = self._config.rotation_scale
         self._samples = 0
+        self._imu_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
+        self._imu_events = NintendoImuEventReader()
+        self._last_imu_update_s = time.perf_counter()
 
     def connect(self) -> None:
         self._teleop.connect()
+        self._imu_events.connect()
+        self._last_imu_update_s = time.perf_counter()
 
     def disconnect(self) -> None:
         self._teleop.disconnect()
+        self._imu_events.close()
 
     @property
     def is_connected(self) -> bool:
@@ -247,32 +333,80 @@ class NintendoProSource:
         axis = rotation_vector / angle
         return np.array([np.cos(angle / 2.0), *(np.sin(angle / 2.0) * axis)])
 
+    @staticmethod
+    def _multiply_quaternions(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        aw, ax, ay, az = np.asarray(a, float)
+        bw, bx, by, bz = np.asarray(b, float)
+        out = np.array(
+            [
+                aw * bw - ax * bx - ay * by - az * bz,
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+            ]
+        )
+        norm = float(np.linalg.norm(out))
+        return out / norm if norm > 1e-12 else np.array([1.0, 0.0, 0.0, 0.0])
+
+    def _deadband(self, values: np.ndarray) -> np.ndarray:
+        threshold = float(abs(self._config.stick_deadband))
+        values = np.asarray(values, float)
+        return np.where(np.abs(values) >= threshold, values, 0.0)
+
     def read(self) -> NintendoProSample:
         action = self._teleop.get_action()
         self._samples += 1
+        debug = self._teleop.latest_debug_state()
 
-        sticks = (
-            np.array(
-                [action.get("target_x", 0.0), action.get("target_y", 0.0), action.get("target_z", 0.0)]
+        raw_left = self._deadband(np.array(debug.get("left_stick", (0.0, 0.0)), dtype=float))
+        raw_right = self._deadband(np.array(debug.get("right_stick", (0.0, 0.0)), dtype=float))
+
+        # `ClutchRetargeter` maps sample X/Y as:
+        #   world_x = sample.left_stick[1], world_y = -sample.left_stick[0].
+        # With the Linux Pro Controller signs this gives the desired operator
+        # mapping: physical X left -> robot left, physical Y down -> robot back.
+        left = raw_left
+
+        buttons = set(debug.get("buttons", ()))
+        clutch = "ZL" in buttons
+        now = time.perf_counter()
+        dt = min(max(now - self._last_imu_update_s, 0.0), float(self._config.max_imu_dt_s))
+        self._last_imu_update_s = now
+
+        gyro_dps = self._imu_events.read_gyro_dps()
+        if gyro_dps is not None:
+            gyro_dps = np.asarray(gyro_dps, float)
+            if self._config.invert_wx:
+                gyro_dps[0] *= -1.0
+            if self._config.invert_wy:
+                gyro_dps[1] *= -1.0
+            if self._config.invert_wz:
+                gyro_dps[2] *= -1.0
+            gyro_dps = np.where(np.abs(gyro_dps) >= float(self._config.imu_gyro_deadband_dps), gyro_dps, 0.0)
+            rotation_vector = np.deg2rad(gyro_dps) * dt
+        else:
+            rotation_vector = (
+                np.array(
+                    [
+                        action.get("target_wx", 0.0),
+                        action.get("target_wy", 0.0),
+                        action.get("target_wz", 0.0),
+                    ]
+                )
+                / max(self._rotation_scale, 1e-9)
             )
-            / max(self._translation_scale, 1e-9)
-        )
-        rotation_vector = (
-            np.array(
-                [
-                    action.get("target_wx", 0.0),
-                    action.get("target_wy", 0.0),
-                    action.get("target_wz", 0.0),
-                ]
-            )
-            / max(self._rotation_scale, 1e-9)
-        )
+
+        if clutch:
+            step_quaternion = self._rotation_vector_to_quaternion(rotation_vector)
+            self._imu_quaternion = self._multiply_quaternions(step_quaternion, self._imu_quaternion)
+        else:
+            self._imu_quaternion = np.array([1.0, 0.0, 0.0, 0.0])
 
         return NintendoProSample(
             t=self._samples / 30.0,
-            left_stick=np.clip(sticks[:2], -1.0, 1.0),
-            right_stick=np.array([float(np.clip(sticks[2], -1.0, 1.0)), 0.0]),
-            imu_quaternion=self._rotation_vector_to_quaternion(rotation_vector),
-            clutch=bool(action.get("enabled", False)),
+            left_stick=np.clip(left, -1.0, 1.0),
+            right_stick=np.array([0.0, float(np.clip(raw_right[1], -1.0, 1.0))]),
+            imu_quaternion=self._imu_quaternion.copy(),
+            clutch=clutch,
             gripper=float(action.get("gripper", 1.0)),
         )

@@ -63,6 +63,7 @@ DEFAULT_MODEL_PATH = REPO_ROOT / "assets" / "mujoco" / "so100.xml"
 
 TCP_SITE = "tcp"
 TOOL_SITE = "tool"
+ROBOT_CLEARANCE_BODIES = frozenset({"upper_arm", "lower_arm", "wrist", "gripper", "jaw"})
 
 
 @dataclass(frozen=True)
@@ -116,6 +117,7 @@ class MujocoArm:
             name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, name)
             for name in (TCP_SITE, TOOL_SITE)
         }
+        self._clearance_geom_ids = self._moving_mesh_geom_ids()
         self.reset_home()
 
     # ----------------------------------------------------------------- state
@@ -138,6 +140,55 @@ class MujocoArm:
     def joints_deg(self) -> np.ndarray:
         """Current configuration, arm joints then gripper."""
         return np.rad2deg(self.data.qpos[self._qpos_index])
+
+    def _moving_mesh_geom_ids(self) -> list[int]:
+        ids: list[int] = []
+        for geom_id in range(self.model.ngeom):
+            mesh_id = int(self.model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                continue
+            body_id = int(self.model.geom_bodyid[geom_id])
+            body_name = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name in ROBOT_CLEARANCE_BODIES:
+                ids.append(geom_id)
+        if not ids:
+            raise ValueError(f"model {self.model_path} has no moving mesh geoms for table clearance")
+        return ids
+
+    def robot_mesh_min_z(self) -> tuple[float, str]:
+        """Lowest world-space vertex z among the moving arm meshes."""
+        best_z = float("inf")
+        best_body = ""
+        for geom_id in self._clearance_geom_ids:
+            mesh_id = int(self.model.geom_dataid[geom_id])
+            vert_adr = int(self.model.mesh_vertadr[mesh_id])
+            vert_num = int(self.model.mesh_vertnum[mesh_id])
+            verts = self.model.mesh_vert[vert_adr : vert_adr + vert_num]
+            rotation = self.data.geom_xmat[geom_id].reshape(3, 3)
+            position = self.data.geom_xpos[geom_id]
+            z = float((verts @ rotation.T + position)[:, 2].min())
+            if z < best_z:
+                body_id = int(self.model.geom_bodyid[geom_id])
+                best_z = z
+                best_body = self._mujoco.mj_id2name(self.model, self._mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        return best_z, best_body
+
+    def command_robot_mesh_min_z_deg(self, joints_deg: np.ndarray) -> tuple[float, str]:
+        """Evaluate moving-mesh table clearance for a candidate command.
+
+        This is a dry run: it temporarily places the MuJoCo data at the
+        candidate configuration, reads the lowest mesh vertex, then restores the
+        previous state.
+        """
+        qpos = self.data.qpos.copy()
+        qvel = self.data.qvel.copy()
+        self.set_joints_deg(joints_deg)
+        try:
+            return self.robot_mesh_min_z()
+        finally:
+            self.data.qpos[:] = qpos
+            self.data.qvel[:] = qvel
+            self._forward()
 
     # ----------------------------------------------------------------- frames
 
@@ -297,6 +348,12 @@ class MujocoBackend:
         for collision in self.sim.self_collisions():
             self.collisions.append((self.write_count, collision))
         self.write_count += 1
+
+    def robot_mesh_min_z(self) -> tuple[float, str]:
+        return self.sim.robot_mesh_min_z()
+
+    def command_robot_mesh_min_z_deg(self, target_deg: np.ndarray) -> tuple[float, str]:
+        return self.sim.command_robot_mesh_min_z_deg(target_deg)
 
     def true_joints_deg(self) -> np.ndarray:
         """Noise-free state. Available in simulation only, for test assertions."""

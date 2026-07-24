@@ -34,7 +34,7 @@ from ..config import SoSnakeConfig
 from ..m3_safety.atlas import DEFAULT_ATLAS_PATH, FeasibilityAtlas
 from ..m3_safety.ik5d import TaskIK5D
 from ..m3_safety.projection import OrientationProjector
-from ..m3_safety.task_pose import SO100TaskPose, TaskFrame, TaskPoseTracker
+from ..m3_safety.task_pose import SO100TaskPose, TaskFrame, TaskPoseTracker, wrap_to_pi
 from ..m4_execution.backends import RobotBackend
 from .clutch import ClutchRetargeter
 from .sources import NintendoProSample, TeleopSource
@@ -79,6 +79,10 @@ class StepRecord:
     atlas_roll_infeasible: bool
     joint_limit_clamped: bool
     joint_rate_clamped: bool
+    command_safety_held: bool
+    command_safety_reason: str
+    robot_mesh_min_z_m: float | None
+    robot_mesh_min_body: str
     ik_converged: bool
     ik_solver_converged: bool
     ik_reseeded: bool
@@ -215,6 +219,7 @@ class TeleopLoop:
         self.sync_target_to_arm()
 
         last_command: np.ndarray | None = None
+        last_gripper_command: float | None = None
         t_start = time.perf_counter()
         t_prev = t_start
         step = 0
@@ -277,10 +282,60 @@ class TeleopLoop:
                 ):
                     result = recovered
                     ik_reseeded = True
-            last_command = result.joints_deg
-
+            commanded_joints_deg = result.joints_deg
+            achieved = result.achieved
+            achieved_pose_world = result.achieved_pose_world
+            position_error_m = result.position_error_m
+            pitch_error_rad = result.pitch_error_rad
+            roll_error_rad = result.roll_error_rad
+            yaw_residual_rad = result.achieved_yaw_residual_rad
+            ik_converged = result.converged
+            command_safety_held = False
+            command_safety_reason = ""
+            robot_mesh_min_z_m: float | None = None
+            robot_mesh_min_body = ""
             gripper_deg = self._gripper_deg(sample.gripper)
-            self.backend.write_joints_deg(np.concatenate([result.joints_deg, [gripper_deg]]))
+            seed_gripper = float(measured[self._n_arm]) if last_gripper_command is None else last_gripper_command
+
+            def hold_previous_command(reason: str) -> None:
+                nonlocal commanded_joints_deg, achieved, achieved_pose_world, position_error_m
+                nonlocal pitch_error_rad, roll_error_rad, yaw_residual_rad, ik_converged
+                nonlocal command_safety_held, command_safety_reason, gripper_deg
+                command_safety_held = True
+                command_safety_reason = reason
+                commanded_joints_deg = np.asarray(seed, float).copy()
+                gripper_deg = seed_gripper
+                readout = self.ik.task_pose(commanded_joints_deg)
+                achieved = readout.pose
+                achieved_pose_world = self.ik.forward(commanded_joints_deg)
+                position_error_m = float(np.linalg.norm(target.position - achieved.position))
+                pitch_error_rad = float(target.pitch - achieved.pitch)
+                roll_error_rad = float(wrap_to_pi(target.roll - achieved.roll))
+                yaw_residual_rad = readout.yaw_residual
+                ik_converged = False
+                self.tracker.set_pose(achieved)
+                self.retargeter.force_target(achieved, sample)
+
+            z_floor = float(self.config.limits.pos_min_m[2])
+            if float(achieved.position[2]) < z_floor:
+                hold_previous_command("post_rate_achieved_z_below_workspace_floor")
+
+            clearance_probe = getattr(self.backend, "command_robot_mesh_min_z_deg", None)
+            if callable(clearance_probe):
+                command = np.concatenate([commanded_joints_deg, [gripper_deg]])
+                robot_mesh_min_z_m, robot_mesh_min_body = clearance_probe(command)
+                if robot_mesh_min_z_m < self.config.teleop.min_robot_mesh_z_m:
+                    hold_previous_command(
+                        "post_rate_robot_mesh_below_clearance:"
+                        f"{robot_mesh_min_body}:{robot_mesh_min_z_m:.4f}"
+                    )
+                    command = np.concatenate([commanded_joints_deg, [gripper_deg]])
+                    robot_mesh_min_z_m, robot_mesh_min_body = clearance_probe(command)
+
+            last_command = commanded_joints_deg
+            last_gripper_command = gripper_deg
+
+            self.backend.write_joints_deg(np.concatenate([commanded_joints_deg, [gripper_deg]]))
 
             now = time.perf_counter()
             self.stats.add(
@@ -291,25 +346,29 @@ class TeleopLoop:
                     task_target=target.as_array(),
                     task_delta=target.as_array() - previous_target.as_array(),
                     gripper_cmd_deg=gripper_deg,
-                    commanded_joints_deg=result.joints_deg,
+                    commanded_joints_deg=commanded_joints_deg,
                     measured_joints_deg=arm_measured,
-                    achieved_task_pose=result.achieved.as_array(),
-                    achieved_position=result.achieved_pose_world[:3, 3],
-                    achieved_quaternion=_rotation_to_quaternion(result.achieved_pose_world[:3, :3]),
-                    ik_position_error_m=result.position_error_m,
-                    ik_pitch_error_rad=result.pitch_error_rad,
-                    ik_roll_error_rad=result.roll_error_rad,
+                    achieved_task_pose=achieved.as_array(),
+                    achieved_position=achieved_pose_world[:3, 3],
+                    achieved_quaternion=_rotation_to_quaternion(achieved_pose_world[:3, :3]),
+                    ik_position_error_m=position_error_m,
+                    ik_pitch_error_rad=pitch_error_rad,
+                    ik_roll_error_rad=roll_error_rad,
                     projected_pitch_delta=retarget.projected_pitch_delta,
                     projected_roll_delta=retarget.projected_roll_delta,
                     rejected_rotation_norm=retarget.rejected_rotation_norm,
-                    yaw_residual_rad=result.achieved_yaw_residual_rad,
+                    yaw_residual_rad=yaw_residual_rad,
                     orientation_saturated=bool(update.pitch_clamped or atlas_pitch_clamped),
                     workspace_clamped=bool(update.position_clamped.any()),
                     atlas_pitch_clamped=atlas_pitch_clamped,
                     atlas_roll_infeasible=atlas_roll_infeasible,
                     joint_limit_clamped=bool(result.limit_clamped.any()),
                     joint_rate_clamped=bool(result.rate_clamped.any()),
-                    ik_converged=result.converged,
+                    command_safety_held=command_safety_held,
+                    command_safety_reason=command_safety_reason,
+                    robot_mesh_min_z_m=robot_mesh_min_z_m,
+                    robot_mesh_min_body=robot_mesh_min_body,
+                    ik_converged=ik_converged,
                     ik_solver_converged=result.solver_converged,
                     ik_reseeded=ik_reseeded,
                     ik_iterations=result.iterations,

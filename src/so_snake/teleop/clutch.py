@@ -77,6 +77,23 @@ class ClutchRetargeter:
         self._latched = None
         self._was_engaged = False
 
+    def force_target(self, pose: SO100TaskPose, sample: NintendoProSample | None = None) -> None:
+        """Re-anchor teleop after a downstream safety hold.
+
+        When a post-IK command is rejected, keeping the old internal target makes
+        the next frame chase the same unsafe joint-space path again. Re-anchor
+        both the frozen target and, if the clutch is held, the IMU reference to
+        the controller's current attitude.
+        """
+        self._target = pose
+        self._latched = pose
+        if sample is not None and sample.clutch:
+            self._imu_reference = quaternion_to_matrix(sample.imu_quaternion)
+            self._was_engaged = True
+        else:
+            self._imu_reference = None
+            self._was_engaged = False
+
     def _stick_velocity(self, sample: NintendoProSample) -> np.ndarray:
         """Stick deflections to metres of world translation for this step.
 
@@ -85,7 +102,8 @@ class ClutchRetargeter:
         Stick +Y reads as "up" on the device, which is forward on the table.
         """
         step = np.asarray(self.teleop.translation_step_m, float)
-        return step * np.array(
+        gain = float(self.teleop.stick_translation_gain)
+        return step * gain * np.array(
             [
                 float(sample.left_stick[1]),  # forward/back  -> world +X
                 float(-sample.left_stick[0]),  # left/right   -> world +Y
