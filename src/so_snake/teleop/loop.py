@@ -220,6 +220,7 @@ class TeleopLoop:
 
         last_command: np.ndarray | None = None
         last_gripper_command: float | None = None
+        clutch_prev = False
         t_start = time.perf_counter()
         t_prev = t_start
         step = 0
@@ -233,6 +234,18 @@ class TeleopLoop:
             measured = self.backend.read_joints_deg()
             arm_measured = measured[: self._n_arm]
             measured_pose = self.ik.task_pose(arm_measured).pose
+
+            if clutch_prev and not sample.clutch:
+                # Clutch just released: snap the tracker's target pose to where the
+                # arm actually is, so the open-loop lead it built up while the
+                # clutch was held does not unwind as a post-release "tail". The
+                # retargeter target is snapped in ClutchRetargeter; the IK *seed*
+                # (`last_command`) is deliberately NOT touched -- seeding IK from
+                # the measurement lets the solve drift between branches (see the
+                # seed comment below), which showed up as the arm jumping to a
+                # different configuration when the clutch was pressed again.
+                self.tracker.set_pose(measured_pose)
+            clutch_prev = bool(sample.clutch)
 
             if "reset" in sample.events:
                 self.tracker.reset()

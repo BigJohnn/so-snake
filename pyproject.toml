@@ -12,6 +12,16 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 sim = ["mujoco>=3.2,<4"]
+# Real Switch Pro teleoperation. lerobot tracks its GitHub main, per the lab setup.
+# Heavy (pulls torch etc.) and hardware-facing, so it is opt-in: the offline gates,
+# the sim, and the scripted-waveform viewer all run without it.
+# The Switch Pro NintendoTeleop lives only in the lab's linkage-x/lerobot fork,
+# on the hph/box_* line -- not in huggingface upstream. Pin the branch that carries it.
+teleop = [
+    "lerobot @ git+ssh://git@github.com/linkage-x/lerobot.git@box",
+    "hidapi>=0.14",       # Switch Pro controller HID
+    "feetech-servo-sdk",  # scservo_sdk: STS3215 bus for the real SOFollower arm
+]
 # Hardware/data collection still depends on the lerobot checkout used in the lab.
 # Keep it out of the minimal install so the offline gates work on macOS and fresh machines.
 

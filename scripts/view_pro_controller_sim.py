@@ -2,7 +2,12 @@
 """Drive the MuJoCo SO-100 model from a USB Nintendo Pro Controller with a viewer.
 
 Run from the repo root:
+    # Linux
     PYTHONPATH=src /home/hanyu/Codes/lerobot/.venv/bin/python scripts/view_pro_controller_sim.py
+    # macOS (Apple Silicon / Intel): the passive viewer must own the main
+    # thread, so it runs under `mjpython`. Launching with plain `python` still
+    # works -- this script re-executes itself under `mjpython` automatically.
+    PYTHONPATH=src .venv/bin/python scripts/view_pro_controller_sim.py
 
 Controls come from lerobot's NintendoTeleop mapping:
   - left stick X/Y: task-space X/Y
@@ -18,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -30,7 +36,13 @@ import numpy as np
 
 from so_snake.config import SoSnakeConfig
 from so_snake.sim import MujocoBackend
-from so_snake.teleop import NintendoProSample, NintendoProSource, TeleopLoop, TeleopSource
+from so_snake.teleop import (
+    NintendoProSample,
+    NintendoProSource,
+    ScriptedSource,
+    TeleopLoop,
+    TeleopSource,
+)
 
 
 class StoppableSource:
@@ -372,8 +384,103 @@ def _run_loop(loop: TeleopLoop, max_steps: int | None, state: WorkerState) -> No
         state.set_done()
 
 
+def _reexec_under_mjpython_if_needed() -> None:
+    """On macOS relaunch the process under `mjpython`, which the viewer requires.
+
+    MuJoCo's `launch_passive` refuses to run on macOS unless the Cocoa UI owns
+    the main thread, which the `mjpython` launcher -- shipped in the same `bin/`
+    as the active interpreter -- arranges. We detect that we are *not* already
+    under it via `mujoco.viewer._MJPYTHON`, the same flag MuJoCo checks before
+    raising, then re-exec this script with its arguments through mjpython. The
+    environment (so `PYTHONPATH=src`) is inherited across the exec.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        import mujoco.viewer
+    except ImportError:
+        return  # let the main import path report the missing dependency
+    if getattr(mujoco.viewer, "_MJPYTHON", None) is not None:
+        return  # already under mjpython
+
+    mjpython = Path(sys.executable).with_name("mjpython")
+    if not mjpython.exists():
+        found = shutil.which("mjpython")
+        mjpython = Path(found) if found else None
+    if mjpython is None:
+        print(
+            "error: on macOS the MuJoCo viewer must run under `mjpython`, which was not "
+            "found next to this interpreter or on PATH.\n"
+            'Install the sim extra (uv pip install -e ".[sim]") and rerun.',
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    script = os.path.abspath(__file__)
+    os.execv(str(mjpython), [str(mjpython), script, *sys.argv[1:]])
+
+
+def _scripted_source() -> ScriptedSource:
+    """A hardware-free waveform that sweeps the workspace, looping forever.
+
+    This is the fallback when no Switch Pro controller / lerobot is present --
+    the default situation on macOS -- so the viewer still shows the arm moving.
+    """
+    source = ScriptedSource.from_waveform(600, rotation_amplitude_rad=0.10)
+    source.loop = True
+    return source
+
+
+def _build_teleop_source(kind: str, device_id: int | None) -> tuple[TeleopSource, str]:
+    """Pick the teleop input for this machine.
+
+    - ``pro``      force the real Switch Pro controller (lerobot + hidapi).
+    - ``scripted`` force the deterministic waveform; needs no hardware, runs anywhere.
+    - ``auto``     try the controller, fall back to the waveform when lerobot or the
+      device is unavailable -- the macOS / no-controller case.
+
+    The controller is *probed by connecting*: lerobot is imported and the HID
+    device opened up front, so ``auto`` can catch a missing dependency or an
+    unplugged pad here instead of failing deep inside the viewer's worker thread.
+    """
+
+    def build_pro() -> TeleopSource:
+        source = NintendoProSource(controller="pro", device_id=device_id)
+        source.connect()  # raises here if lerobot / the device is unavailable
+        return source
+
+    if kind == "scripted":
+        return _scripted_source(), "scripted waveform (no hardware)"
+    if kind == "pro":
+        return build_pro(), "Switch Pro controller"
+
+    # auto
+    try:
+        return build_pro(), "Switch Pro controller"
+    except Exception as exc:
+        print(
+            f"note: no Switch Pro controller available ({type(exc).__name__}: {exc}); "
+            "using the scripted waveform.",
+            file=sys.stderr,
+        )
+        print(
+            "      to teleoperate: install lerobot main "
+            "(pip install 'lerobot @ git+https://github.com/huggingface/lerobot.git') "
+            "plus a Pro controller, then pass --source pro.",
+            file=sys.stderr,
+        )
+        return _scripted_source(), "scripted waveform (no hardware)"
+
+
 def main() -> int:
+    _reexec_under_mjpython_if_needed()
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--source",
+        choices=("auto", "pro", "scripted"),
+        default="auto",
+        help="teleop input: auto-detect (default), force the Pro controller, or the scripted waveform",
+    )
     parser.add_argument("--device-id", type=int, default=None, help="optional lerobot NintendoTeleop device id")
     parser.add_argument("--steps", type=int, default=None, help="stop after this many control frames")
     parser.add_argument("--print-every", type=float, default=1.0, help="seconds between terminal status lines")
@@ -399,16 +506,15 @@ def main() -> int:
 
         config = SoSnakeConfig()
         stop_event = threading.Event()
-        source = StoppableSource(
-            NintendoProSource(controller="pro", device_id=args.device_id),
-            stop_event,
-        )
+        inner_source, source_label = _build_teleop_source(args.source, args.device_id)
+        source = StoppableSource(inner_source, stop_event)
         backend = ViewerLockedBackend(MujocoBackend(arm=config.arm))
         loop = TeleopLoop(source, backend, config)
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         print(
-            "\nThis script needs lerobot's NintendoTeleop, hidapi, MuJoCo, and a graphical display.",
+            "\nThis script needs MuJoCo and a graphical display; the Pro controller "
+            "additionally needs lerobot + hidapi. Try --source scripted to run without a controller.",
             file=sys.stderr,
         )
         return 2
@@ -422,7 +528,11 @@ def main() -> int:
     )
     worker = threading.Thread(target=_run_loop, args=(loop, args.steps, state), daemon=True)
 
-    print("Opening MuJoCo viewer. Use left stick / right stick Y; hold ZL for IMU rotation.")
+    print(f"Opening MuJoCo viewer. Teleop source: {source_label}.")
+    if args.source != "scripted" and source_label.startswith("Switch"):
+        print("Use left stick / right stick Y; hold ZL for IMU rotation.")
+    else:
+        print("Scripted sweep is driving the arm; no controller input needed.")
     print("Close the viewer or press Ctrl-C to stop.")
     if warn_log:
         print(f"Teleop warning log: {warn_log}")

@@ -51,9 +51,29 @@ PYTHONPATH=src scripts/check_teleop_loop.py --steps 300
 uv pip install -e ".[dev,sim]"   # MuJoCo 仿真/离屏相机
 ```
 
+MuJoCo 仿真(含离屏相机)在 macOS Apple Silicon(MBP M1/M2/…)与 Linux 上通用。
+唯一的平台差异是交互式 viewer:macOS 要求 passive viewer 独占主线程,须由
+`.[sim]` 附带的 `mjpython` 启动。`scripts/view_pro_controller_sim.py` 会在 macOS
+上用普通 `python` 启动时自动 re-exec 到 `mjpython`,无需手动切换。
+
+viewer 的遥操作输入也自动选路:`--source auto`(默认)先尝试真手柄,缺 lerobot 或
+没插手柄(macOS 常态)时回退到内置 scripted 波形,让仿真照样动;`--source pro`
+强制真手柄,`--source scripted` 强制波形。想在本机用真手柄,装 `teleop` 附加层。
+注意:Switch Pro 的 `NintendoTeleop` 只在 lab 的 `linkage-x/lerobot` fork 的 `box`
+分支上,huggingface 上游 main 没有,所以 `teleop` 附加层锁定该 fork 分支:
+
+```bash
+# GIT_LFS_SKIP_SMUDGE=1 跳过 lerobot 仓库缺失的 LFS 测试图片,否则 git-lfs smudge 会让安装失败
+# 需要对 linkage-x/lerobot 的 SSH 访问权限
+GIT_LFS_SKIP_SMUDGE=1 uv pip install -e ".[dev,sim,teleop]"   # 真手柄遥操作(拉取 torch 等,较重)
+PYTHONPATH=src .venv/bin/python scripts/view_pro_controller_sim.py                  # 自动选路
+PYTHONPATH=src .venv/bin/python scripts/view_pro_controller_sim.py --source scripted # 无手柄看仿真
+```
+
 | 依赖 | 安装层 | 用途 |
 |---|---|---|
-| mujoco | `.[sim]` | URDF/STL 仿真、解析 Jacobian 交叉验证、离屏相机 |
+| mujoco | `.[sim]` | URDF/STL 仿真、解析 Jacobian 交叉验证、离屏相机;macOS viewer 经 `mjpython` |
+| lerobot + hidapi | `.[teleop]` | 本机真 Switch Pro 手柄遥操作(lerobot=linkage-x fork `box` 分支);viewer `--source pro` |
 | placo | lab/lerobot 环境 | 独立 FK 交叉验证 |
 | lerobot | lab/lerobot 环境 | SOFollower、NintendoTeleop、LeRobotDataset、训练 |
 | feetech-servo-sdk | lab/lerobot 环境 | STS3215 舵机通讯 |
@@ -69,6 +89,63 @@ uv pip install -e ".[dev,sim]"   # MuJoCo 仿真/离屏相机
 
 注意:系统环境里可能有 ROS pytest 插件,会在缺依赖或 hook 不匹配时污染测试收集。
 本仓库 Gate 使用 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q`。
+
+## 真机 preflight
+
+上真机前先在插着臂的机器上跑 preflight。除 `--probe` 外全部不碰硬件;`--probe`
+只读地打开舵机总线(ping + 读当前位置),**不上力矩、不发目标位、不会让臂动**:
+
+```bash
+# 安全检查:依赖 / 关节契约 / 串口 / 手柄 / 标定文件是否存在
+PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --port <PORT>
+# 追加只读总线探测(臂需上电插好;不会动臂)
+PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --port <PORT> --probe
+```
+
+真机需要 `.[teleop]` 附加层(含 `feetech-servo-sdk` 提供 `scservo_sdk`)。macOS 上
+串口通常是 `/dev/cu.usbmodem*`。首次使用必须先标定(会手动移动臂过全程),标定与
+第一次发力矩/运动都是操作者手动步骤,脚本不代劳。舵机 id 已是 1–6(preflight 探测
+确认),无需 `lerobot-setup-motors`,直接标定即可:
+
+```bash
+# 交互式:先把每个关节摆到量程中点回车,再把所有关节各自过一遍全程,回车结束
+lerobot-calibrate --robot.type=so100_follower \
+    --robot.port=/dev/cu.usbmodem58760434321 --robot.id=so_snake
+```
+
+标定文件写到 `~/.cache/huggingface/lerobot/calibration/robots/so_follower/<id>.json`;
+要重标定就先删掉它。官方教程:<https://huggingface.co/docs/lerobot/en/so100>
+(SO-100 与 SO-101 标定流程通用,视频见 SO-101 文档)。
+
+### 关节坐标映射(lerobot ↔ URDF)
+
+lerobot 标定后的度数(零位=量程中点)和本仓运动学用的 **URDF 约定不一致**,直接
+驱动会撞机。用 `scripts/map_joint_frames.py` 建立并核对每关节 `q_urdf = sign·q_lero
++ offset` 的映射,全程只读、不发运动:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py draft            # 零运动:从标定文件算 offset
+PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py signs --port <PORT>  # 手推到硬限位定 sign
+PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py check --port <PORT>  # 手扶核对映射
+```
+
+映射写到 `assets/so100_joint_map.json`。`SOFollowerBackend(joint_map=...)` 读时
+lero→URDF、写时 URDF→lero(精确双射,读回即写不会跳)。
+
+### 真机遥操
+
+映射就绪后用 `scripts/teleop_real_arm.py`,它把
+`NintendoProSource → TeleopLoop → SOFollowerBackend` 接到真机,并加保守安全默认:
+`max_relative_target`(每步硬件钳位,默认 5°)、只在按住 clutch(ZL)时运动、退出时
+落力矩。首次务必**清空工作区、手放急停旁、小幅慢速起步**:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/teleop_real_arm.py \
+    --port <PORT> --max-relative-target 5 --steps 600
+```
+
+`SOFollowerBackend` 用 lerobot 的 `SOFollowerRobotConfig`,`max_relative_target` 是
+后端硬件层钳位,和回路自己的 `max_joint_step_deg`(6°/步)叠加。
 
 ## 与 lerobot 的关系
 

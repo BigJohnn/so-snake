@@ -1,0 +1,50 @@
+{
+  "convention": "q_urdf_deg = sign * q_lerobot_deg + offset_deg",
+  "robot_id": "so_snake",
+  "arm_joints": [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll"
+  ],
+  "gripper_joint": "gripper",
+  "joints": {
+    "shoulder_pan": {
+      "type": "degrees_affine",
+      "sign": -1,
+      "offset_deg": 0.0,
+      "span_residual_deg": -15.29
+    },
+    "shoulder_lift": {
+      "type": "degrees_affine",
+      "sign": 1,
+      "offset_deg": 100.27,
+      "span_residual_deg": -15.398
+    },
+    "elbow_flex": {
+      "type": "degrees_affine",
+      "sign": 1,
+      "offset_deg": -90.0,
+      "span_residual_deg": 13.406
+    },
+    "wrist_flex": {
+      "type": "degrees_affine",
+      "sign": 1,
+      "offset_deg": -37.245,
+      "span_residual_deg": 5.24
+    },
+    "wrist_roll": {
+      "type": "degrees_affine",
+      "sign": 1,
+      "offset_deg": 0.0,
+      "span_residual_deg": 0.0
+    },
+    "gripper": {
+      "type": "range_0_100_to_deg",
+      "urdf_min_deg": -11.46,
+      "urdf_max_deg": 114.59
+    }
+  },
+  "note": "signs are PROVISIONAL until confirmed with `verify`; see script docstring"
+}

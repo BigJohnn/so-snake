@@ -20,6 +20,7 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from ..config import ArmConfig, GRIPPER_JOINT, TeleopConfig
+from .joint_map import JointFrameMap
 
 
 @runtime_checkable
@@ -132,16 +133,47 @@ class MockFollower:
 class SOFollowerBackend:
     """The real SO-100, via lerobot's `SOFollower`.
 
-    Untested against hardware -- the arm has not been connected yet. The port
-    and calibration must be established on the physical robot before this is
-    trusted; see the "on-hardware" checklist in the README.
+    Config path validated against the lab's lerobot (`linkage-x` `box` branch);
+    not yet exercised against a moving arm. Before this is trusted the port must
+    be identified and the motors calibrated on the physical robot -- run
+    `scripts/preflight_real_arm.py`, which checks both without moving anything.
+
+    `max_relative_target` is lerobot's per-step safety clamp: the magnitude of
+    the relative move requested in one `send_action` is clipped to this (a scalar
+    for all motors, or a per-motor dict). It is a hardware-level backstop behind
+    the loop's own `max_joint_step_deg`; leave it `None` only once teleop is
+    trusted.
+
+    `joint_map` reconciles lerobot's calibration frame with the URDF frame the
+    control loop works in: reads are mapped lerobot->URDF and writes URDF->lerobot
+    (see `joint_map.py`). Without it the loop would drive the arm in the wrong
+    frame; it must be supplied for real teleop. `None` passes values through raw,
+    for bring-up diagnostics only.
     """
 
-    def __init__(self, port: str, arm: ArmConfig | None = None, robot_id: str = "so_snake") -> None:
-        from lerobot.robots.so_follower import SOFollower, SOFollowerConfig
+    def __init__(
+        self,
+        port: str,
+        arm: ArmConfig | None = None,
+        robot_id: str = "so_snake",
+        *,
+        max_relative_target: float | dict[str, float] | None = None,
+        joint_map: JointFrameMap | None = None,
+    ) -> None:
+        # SOFollowerRobotConfig = RobotConfig + SOFollowerConfig. The bare
+        # SOFollowerConfig has no `id`/`calibration_dir`, so lerobot's base
+        # Robot.__init__ (which reads `config.id`) raises on it. The registered
+        # subclass carries both, plus the max_relative_target safety clamp.
+        from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 
         self.arm = arm or ArmConfig()
-        self._config = SOFollowerConfig(port=port, id=robot_id)
+        self.joint_map = joint_map
+        self._config = SOFollowerRobotConfig(
+            port=port,
+            id=robot_id,
+            max_relative_target=max_relative_target,
+            use_degrees=True,
+        )
         self._robot = SOFollower(self._config)
 
     @property
@@ -152,6 +184,16 @@ class SOFollowerBackend:
         self._robot.connect()
 
     def disconnect(self) -> None:
+        # Drop torque on every motor while the port is still fully open, THEN do
+        # the normal disconnect. lerobot's own disable_torque_on_disconnect clears
+        # the port before issuing the disable writes, which can leave the last
+        # motor on the bus -- the gripper -- still energized. Doing it explicitly
+        # here first guarantees the gripper relaxes when the program exits.
+        try:
+            if self._robot.is_connected:
+                self._robot.bus.disable_torque(num_retry=5)
+        except Exception:  # noqa: BLE001 - best effort; the normal path runs next
+            pass
         self._robot.disconnect()
 
     @property
@@ -159,10 +201,22 @@ class SOFollowerBackend:
         return bool(self._robot.is_connected)
 
     def read_joints_deg(self) -> np.ndarray:
+        """Measured joints in URDF degrees (mapped from lerobot's frame)."""
         obs = self._robot.get_observation()
-        return np.array([obs[f"{name}.pos"] for name in self.joint_names], dtype=float)
+        lerobot = [obs[f"{name}.pos"] for name in self.joint_names]
+        if self.joint_map is None:
+            return np.array(lerobot, dtype=float)
+        return np.array(
+            [self.joint_map.lerobot_to_urdf(name, v) for name, v in zip(self.joint_names, lerobot)],
+            dtype=float,
+        )
 
     def write_joints_deg(self, target_deg: np.ndarray) -> None:
+        """Command joints given in URDF degrees (mapped back into lerobot's frame)."""
         target = np.asarray(target_deg, float)
-        action = {f"{name}.pos": float(v) for name, v in zip(self.joint_names, target, strict=True)}
+        if self.joint_map is None:
+            values = target
+        else:
+            values = [self.joint_map.urdf_to_lerobot(name, v) for name, v in zip(self.joint_names, target)]
+        action = {f"{name}.pos": float(v) for name, v in zip(self.joint_names, values, strict=True)}
         self._robot.send_action(action)

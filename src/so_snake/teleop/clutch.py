@@ -125,8 +125,9 @@ class ClutchRetargeter:
                 and at no other time.
         """
         latched_now = False
+        was_engaged = self._was_engaged
 
-        if sample.clutch and not self._was_engaged:
+        if sample.clutch and not was_engaged:
             self._imu_reference = quaternion_to_matrix(sample.imu_quaternion)
             self._latched = measured
             self._target = measured
@@ -137,6 +138,15 @@ class ClutchRetargeter:
         self._was_engaged = sample.clutch
 
         if not sample.clutch:
+            if was_engaged:
+                # Falling edge -> kill the "motion tail". The target integrates
+                # open-loop (`self._target = self._target + delta`), so while the
+                # clutch is held it leads the physical arm by the servo's tracking
+                # lag (and the max_relative_target rate clamp). Freezing it at that
+                # leading value lets the arm keep coasting into it after release.
+                # Anchoring the frozen target to the measured pose discards the
+                # lead, so the arm stops where it actually is.
+                self._target = measured
             # Released: hold. Re-emitting the frozen target rather than stopping
             # the loop keeps IK correcting against servo droop.
             return RetargetResult(
@@ -152,7 +162,11 @@ class ClutchRetargeter:
         delta_position = self._stick_velocity(sample)
 
         rotation_now = quaternion_to_matrix(sample.imu_quaternion)
-        omega = rotation_log(rotation_now @ self._imu_reference.T) * self.teleop.rotation_gain
+        # Negated: on this controller the IMU's rotation sense is flipped relative
+        # to the world convention the projector expects, so tilting the wrist one
+        # way turned the tool the other way. The projector is linear in `omega`,
+        # so a single negation flips both the pitch and the roll direction.
+        omega = -rotation_log(rotation_now @ self._imu_reference.T) * self.teleop.rotation_gain
 
         # Projected at the *latched* pose, not the current target. Both give the
         # same axes to within the translation the operator has done since

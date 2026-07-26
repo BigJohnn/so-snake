@@ -1,0 +1,19 @@
+{
+  "convention": "URDF degrees (control frame); command through SOFollowerBackend(joint_map)",
+  "joints_urdf_deg": {
+    "shoulder_pan": 8.396,
+    "shoulder_lift": 75.83,
+    "elbow_flex": -45.956,
+    "wrist_flex": 42.184,
+    "wrist_roll": 3.56,
+    "gripper": 89.582
+  },
+  "recorded_from_map": "assets/so100_joint_map.json",
+  "task_pose_xyz_m": [
+    0.1661,
+    0.0171,
+    0.0391
+  ],
+  "in_workspace_box": false,
+  "in_joint_limits": true
+}
