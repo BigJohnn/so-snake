@@ -26,7 +26,9 @@ changing the projector or the IK later does not mean re-recording.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
+from typing import Callable
 
 import numpy as np
 
@@ -94,12 +96,27 @@ class StepRecord:
 
 @dataclass
 class LoopStats:
-    """Aggregates a run into the numbers the blueprint asks M3/M4 to report."""
+    """Aggregates a run into the numbers the blueprint asks M3/M4 to report.
+
+    `capacity` bounds how many records are retained. `None` -- the default --
+    keeps everything, which is what the offline gates want: they run a known
+    number of steps and then summarise all of them. A GUI session runs for as
+    long as the operator leaves it running, at 30 Hz, so it passes a capacity
+    and gets a sliding window; the episodes themselves are written to disk by
+    the recorder as they happen, not accumulated here.
+    """
 
     records: list[StepRecord] = field(default_factory=list)
+    capacity: int | None = None
+    total_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.capacity is not None:
+            self.records = deque(self.records, maxlen=self.capacity)  # type: ignore[assignment]
 
     def add(self, record: StepRecord) -> None:
         self.records.append(record)
+        self.total_steps += 1
 
     def summary(self) -> dict[str, float]:
         if not self.records:
@@ -163,6 +180,7 @@ class TeleopLoop:
         config: SoSnakeConfig | None = None,
         ik: TaskIK5D | None = None,
         atlas: FeasibilityAtlas | None = None,
+        stats_capacity: int | None = None,
     ) -> None:
         self.config = config or SoSnakeConfig()
         self.source = source
@@ -179,7 +197,7 @@ class TeleopLoop:
         self._n_arm = len(self.config.arm.joint_names)
         home_readout = self.ik.task_pose(np.asarray(self.config.teleop.home_joints_deg, float))
         self.tracker = TaskPoseTracker(self.config.limits, home=home_readout.pose)
-        self.stats = LoopStats()
+        self.stats = LoopStats(capacity=stats_capacity)
 
     def _gripper_deg(self, opening: float) -> float:
         teleop = self.config.teleop
@@ -201,13 +219,30 @@ class TeleopLoop:
         self.tracker.set_pose(self.measured_task_pose())
         self.retargeter.reset()
 
-    def run(self, max_steps: int | None = None, realtime: bool = True) -> LoopStats:
+    def run(
+        self,
+        max_steps: int | None = None,
+        realtime: bool = True,
+        *,
+        on_step: Callable[[StepRecord], None] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> LoopStats:
         """Run until the source signals stop, or `max_steps` steps have elapsed.
 
         Args:
             max_steps: Stop after this many steps. None runs until the source stops.
             realtime: Sleep to hold `control_hz`. Disable for offline runs, where
                 pacing to wall-clock only makes the test slow.
+            on_step: Called with each `StepRecord` as it is produced. This is the
+                recorder's and the GUI's only entry point into the loop: they
+                observe, they do not get to change what the loop commands. Raising
+                from here aborts the run, which is the desired behaviour if the
+                disk the episode is being written to fills up.
+            should_continue: Polled once per step before reading the source.
+                Returning False stops the loop between steps rather than mid-way
+                through one, so the arm is never left having been given a target
+                that was not also logged. A GUI stop button lives here; the
+                source's own "stop" event is unchanged and still honoured.
         """
         period = 1.0 / self.config.teleop.control_hz
 
@@ -227,6 +262,8 @@ class TeleopLoop:
 
         while max_steps is None or step < max_steps:
             t_loop = time.perf_counter()
+            if should_continue is not None and not should_continue():
+                break
             sample: NintendoProSample = self.source.read()
             if "stop" in sample.events:
                 break
@@ -355,45 +392,46 @@ class TeleopLoop:
             self.backend.write_joints_deg(np.concatenate([commanded_joints_deg, [gripper_deg]]))
 
             now = time.perf_counter()
-            self.stats.add(
-                StepRecord(
-                    index=step,
-                    t=now - t_start,
-                    raw=sample.as_log_record(),
-                    task_target=target.as_array(),
-                    task_delta=target.as_array() - previous_target.as_array(),
-                    gripper_cmd_deg=gripper_deg,
-                    commanded_joints_deg=commanded_joints_deg,
-                    measured_joints_deg=arm_measured,
-                    achieved_task_pose=achieved.as_array(),
-                    achieved_position=achieved_pose_world[:3, 3],
-                    achieved_quaternion=_rotation_to_quaternion(achieved_pose_world[:3, :3]),
-                    ik_position_error_m=position_error_m,
-                    ik_pitch_error_rad=pitch_error_rad,
-                    ik_roll_error_rad=roll_error_rad,
-                    projected_pitch_delta=retarget.projected_pitch_delta,
-                    projected_roll_delta=retarget.projected_roll_delta,
-                    rejected_rotation_norm=retarget.rejected_rotation_norm,
-                    yaw_residual_rad=yaw_residual_rad,
-                    orientation_saturated=bool(update.pitch_clamped or atlas_pitch_clamped),
-                    workspace_clamped=bool(update.position_clamped.any()),
-                    atlas_pitch_clamped=atlas_pitch_clamped,
-                    atlas_roll_infeasible=atlas_roll_infeasible,
-                    joint_limit_clamped=bool(result.limit_clamped.any()),
-                    joint_rate_clamped=bool(result.rate_clamped.any()),
-                    command_safety_held=command_safety_held,
-                    command_safety_reason=command_safety_reason,
-                    robot_mesh_min_z_m=robot_mesh_min_z_m,
-                    robot_mesh_min_body=robot_mesh_min_body,
-                    ik_converged=ik_converged,
-                    ik_solver_converged=result.solver_converged,
-                    ik_reseeded=ik_reseeded,
-                    ik_iterations=result.iterations,
-                    ik_min_singular_value=result.min_singular_value,
-                    clutch_engaged=retarget.engaged,
-                    loop_dt_s=now - t_prev,
-                )
+            record = StepRecord(
+                index=step,
+                t=now - t_start,
+                raw=sample.as_log_record(),
+                task_target=target.as_array(),
+                task_delta=target.as_array() - previous_target.as_array(),
+                gripper_cmd_deg=gripper_deg,
+                commanded_joints_deg=commanded_joints_deg,
+                measured_joints_deg=arm_measured,
+                achieved_task_pose=achieved.as_array(),
+                achieved_position=achieved_pose_world[:3, 3],
+                achieved_quaternion=_rotation_to_quaternion(achieved_pose_world[:3, :3]),
+                ik_position_error_m=position_error_m,
+                ik_pitch_error_rad=pitch_error_rad,
+                ik_roll_error_rad=roll_error_rad,
+                projected_pitch_delta=retarget.projected_pitch_delta,
+                projected_roll_delta=retarget.projected_roll_delta,
+                rejected_rotation_norm=retarget.rejected_rotation_norm,
+                yaw_residual_rad=yaw_residual_rad,
+                orientation_saturated=bool(update.pitch_clamped or atlas_pitch_clamped),
+                workspace_clamped=bool(update.position_clamped.any()),
+                atlas_pitch_clamped=atlas_pitch_clamped,
+                atlas_roll_infeasible=atlas_roll_infeasible,
+                joint_limit_clamped=bool(result.limit_clamped.any()),
+                joint_rate_clamped=bool(result.rate_clamped.any()),
+                command_safety_held=command_safety_held,
+                command_safety_reason=command_safety_reason,
+                robot_mesh_min_z_m=robot_mesh_min_z_m,
+                robot_mesh_min_body=robot_mesh_min_body,
+                ik_converged=ik_converged,
+                ik_solver_converged=result.solver_converged,
+                ik_reseeded=ik_reseeded,
+                ik_iterations=result.iterations,
+                ik_min_singular_value=result.min_singular_value,
+                clutch_engaged=retarget.engaged,
+                loop_dt_s=now - t_prev,
             )
+            self.stats.add(record)
+            if on_step is not None:
+                on_step(record)
             t_prev = now
             step += 1
 

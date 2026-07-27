@@ -147,6 +147,56 @@ PYTHONPATH=src .venv/bin/python scripts/teleop_real_arm.py \
 `SOFollowerBackend` 用 lerobot 的 `SOFollowerRobotConfig`,`max_relative_target` 是
 后端硬件层钳位,和回路自己的 `max_joint_step_deg`(6°/步)叠加。
 
+## 录制与回放
+
+一条 episode 是一个目录:`meta.json`(录制条件 + 配置快照 + 指标)加 `frames.npz`
+(每个控制步一行)。用 npz 而不是 parquet,是因为 numpy 是本仓唯一的基础依赖 ——
+录制是整条链路里最不能因为环境原因失败的一环,人和臂都挪开之后那条演示就补不回来了。
+`LeRobotDataset` 仍是训练格式,转换器该待在装了 lerobot 的训练机上,还没写。
+
+列名就是 `TeleopLoop` 文档里那套 dataset layout:`action.raw.*`(设备原样上报)、
+`action.task.*`(策略的训练目标)、`action.joint.*`(发给舵机的)、
+`observation.state.*`、`diagnostics.*`。三条动作流都存,是故意的冗余:IK 改了之后,
+旧数据要能在新解算器上重放并对比。
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/record_episode.py --backend mujoco --steps 600 \
+    --task "把红色方块放进框里"
+PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --list
+PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --check      # 只检查,不动
+PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --backend mujoco --mode task
+```
+
+回放有两种模式,回答的是不同问题:
+
+| 模式 | 问题 | 偏差说明什么 |
+|---|---|---|
+| `joint` | 机械臂能不能复现当时的动作 | 硬件、伺服、场景 —— 不是解算 |
+| `task` | 今天的控制器会不会做同样的事 | 改了 projector / atlas / IK 之后的回归 |
+
+录下来的东西本身不是一串安全指令,所以回放前会:静态检查(关节顺序、超出当前限位的
+指令、该速度会不会超限速,`--check` 单独跑),先限速无 IK 地**走到第一帧**,按
+**deg/s** 而不是 deg/步 限速(否则 2× 速度会让臂真的快一倍而每步检查照样通过),按
+**当前**配置的关节限位钳位,以及在 MuJoCo 下逐帧检查网格离地。
+
+## Web GUI
+
+```bash
+cd tools/gui/frontend && npm install && npm run build
+PYTHONPATH=src .venv/bin/python scripts/serve_gui.py     # http://localhost:8770
+```
+
+前后端都在本机一个进程里:网关(标准库 `http.server` + numpy,没有 web 框架)自己发
+构建好的前端。四个页面 —— 遥操作/录制、数据集、回放、进度。细节见
+[`tools/gui/README.md`](tools/gui/README.md)。
+
+默认只绑 `127.0.0.1`;`--host 0.0.0.0` 会把「让真臂动」的按钮暴露到网络上。
+
+仿真相机预览要能渲染。启动时会打出选了哪个 GL 后端(egl → glfw → osmesa,子进程里
+真渲染一帧决定),`MUJOCO_GL` 已 export 则跳过探测。撞到 `EGLDeviceEXT` 报错、或者
+预览花屏/撕裂,见 [`tools/gui/README.md`](tools/gui/README.md) 的 GL 一节 —— 两个坑
+都有记录,后者(GL context 的线程亲和性)在改 `SimPreview` 之前必读。
+
 ## 与 lerobot 的关系
 
 so-snake 是**独立仓库**,依赖 lerobot 而不修改它。复用其现成件:
@@ -174,8 +224,11 @@ Mock 后端离线验证整条链路,回家把后端切成真机即可。
 - [x] Mock 机器人后端 + 30Hz 闭环,离线跑通(位置误差中位 0.010 mm)
 - [x] **迁移到 5 维任务空间** —— `(x, y, z, pitch, roll)`,位置锚定 chart,atlas pitch clamp,5D DLS IK
 - [x] MuJoCo 3.6 仿真模型 + 三方运动学互校(ArmChain / placo / MuJoCo)
-- [x] Gate A/B 与默认闭环 desk check: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q` 34 passed; `scripts/check_teleop_loop.py --steps 300` PASS
-- [ ] 双相机采集 + LeRobotDataset 落盘
+- [x] Gate A/B 与默认闭环 desk check: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q` 88 passed; `scripts/check_teleop_loop.py --steps 300` PASS
+- [x] Episode 录制 + joint/task 双模式回放,含静态检查与限速/离地保护
+- [x] 本机 Web GUI:遥操作、录制、回放、进度看板
+- [ ] 双相机采集(GUI 已能实时预览 MuJoCo 双相机,但帧还没写进 episode)
+- [ ] LeRobotDataset 导出
 - [ ] **待实测**:舵机 ID/标定、TCP 实测校准、相机外参、clutch 手感调参
 
 ### 5 维任务空间迁移
@@ -197,12 +250,17 @@ scripts/               可复现的分析与验证脚本
 src/so_snake/          M0~M5 模块实现
 assets/atlas/          SO-100 可行性图集
 assets/mujoco/         MuJoCo XML 模型
+tools/gui/frontend/    Web GUI 前端(React + Vite;后端在 src/so_snake/gui/)
+data/episodes/         录制的 episode(不入版本库)
 ```
 
 ## 脚本
 
 | 脚本 | 用途 | 需要硬件 |
 |---|---|---|
+| `scripts/serve_gui.py` | 本机 Web GUI(遥操作 / 录制 / 回放 / 进度) | 否 |
+| `scripts/record_episode.py` | 录制一条 episode 到 `data/episodes/` | 视 backend |
+| `scripts/replay_episode.py` | 回放 episode(`--check` 只检查不动) | 视 backend |
 | `scripts/check_kinematics_agreement.py` | ArmChain / placo / MuJoCo 三方 FK/Jacobian 互校 | 否 |
 | `scripts/check_teleop_loop.py` | MockFollower + ScriptedSource 默认闭环 Gate | 否 |
 | `scripts/check_kinematics.py` | 旧 FK/IK round-trip 验证(待归档) | 否 |

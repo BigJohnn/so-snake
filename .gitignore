@@ -4,11 +4,16 @@ __pycache__/
 venv/
 *.egg-info/
 build/
-dist/
+node_modules/
+# Leading slash: `dist/` unanchored would also match nothing here today, but the
+# frontend's build output is the only one, and anchoring keeps it that way.
+/tools/gui/frontend/dist/
 
-# Recorded episodes and training runs live outside version control.
-data/
-outputs/
+# Recorded episodes and training runs live outside version control. Anchored to
+# the repo root -- an unanchored `data/` also matches `src/so_snake/data/`, the
+# recording package, and silently drops it from every commit.
+/data/
+/outputs/
 wandb/
 *.mp4
 !image.png
