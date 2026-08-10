@@ -152,8 +152,21 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 "disk is -- verified by encoding before it is used, and both the choice "
                 "and its reason go into meta.json.",
                 module="so_snake.data.video",
-                evidence="322-step take, two 1080p cameras: 322 frames each, 0 dropped, "
-                         "0 stale; loop 26.6 Hz median while encoding vs 26.7 Hz idle",
+                evidence="501-step take, two 1080p cameras: 501 frames each, 0 dropped, "
+                         "0 stale, matching n_steps exactly; loop 26.5 Hz median while "
+                         "encoding with both previews polling vs 26.7 Hz idle",
+            ),
+            _item(
+                "review", "Reviewing a take against its video", "done",
+                "The dataset page plays both cameras beside the trajectory plots, sharing a "
+                "cursor. Alignment is by frame index, not timestamp: the recorder writes one "
+                "frame per control step, but the file carries the configured control_hz while "
+                "the loop runs slower, so on a 19.2 s take the video is 16.7 s and a "
+                "timestamp-aligned cursor would be 2.5 s out by the end. Clicking a plot seeks "
+                "the video; the video's own clock drives the cursor while it plays.",
+                module="so_snake.gui.server",
+                evidence="ep_20260810_232308: 501 video frames == 501 rows on both cameras; "
+                         "byte-range requests answered 206 so the player can seek",
             ),
             _item(
                 "lerobot-export", "LeRobotDataset export", "todo",

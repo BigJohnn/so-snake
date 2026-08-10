@@ -229,3 +229,4 @@ td.num, th.num { font-family: var(--mono); text-align: right; }
   line-height: 14px; padding: 0; font-size: 11px; border-radius: 3px;
   border: 1px solid var(--line); background: var(--panel-2); cursor: pointer;
 }
+.preview video { width: 100%; display: block; border-radius: 4px; background: #000; }

@@ -320,12 +320,76 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(lambda: self.gateway.episode_detail(episode_id))
         elif path == "/api/cameras":
             self._guard(self.gateway.cameras_payload)
+        elif path == "/api/episode/video":
+            self._serve_episode_video(_str_param(query, "id"), _str_param(query, "camera"))
         elif path == "/api/preview.png":
             self._serve_preview(query)
         elif path.startswith("/api/"):
             self._error(HTTPStatus.NOT_FOUND, f"no such endpoint: {path}")
         else:
             self._serve_frontend(path)
+
+    def _serve_episode_video(self, episode_id: str, camera: str) -> None:
+        """Stream one episode's camera file, with byte ranges.
+
+        Range support is not optional here: a `<video>` element that cannot ask
+        for a byte range cannot seek, and an episode video that only plays from
+        the start is useless for reviewing the moment a take went wrong.
+        `SimpleHTTPRequestHandler` does not implement it, so it is done here.
+        """
+        if camera not in CAMERA_ROLES:
+            self._error(HTTPStatus.BAD_REQUEST, f"unknown camera: {camera}")
+            return
+        try:
+            directory = self.gateway.session.store.path_of(episode_id)
+        except ValueError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        path = directory / f"{camera}.mp4"
+        if not path.is_file():
+            self._error(HTTPStatus.NOT_FOUND, f"episode {episode_id} has no {camera} video")
+            return
+
+        size = path.stat().st_size
+        start, end = 0, size - 1
+        partial = False
+        header = self.headers.get("Range", "")
+        if header.startswith("bytes="):
+            first, _, last = header[len("bytes="):].partition("-")
+            try:
+                if first:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+                else:  # a suffix range: the last N bytes
+                    start = max(0, size - int(last))
+                partial = True
+            except ValueError:
+                partial = False
+                start, end = 0, size - 1
+        end = min(end, size - 1)
+        if start > end:
+            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.end_headers()
+            return
+
+        length = end - start + 1
+        self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        with path.open("rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = handle.read(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _serve_preview(self, query: dict[str, list[str]]) -> None:
         camera = _str_param(query, "camera", "third_person")

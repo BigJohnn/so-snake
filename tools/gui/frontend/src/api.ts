@@ -100,5 +100,8 @@ export const api = {
     post<Snapshot>("/api/replay/start", body)
 };
 
+export const episodeVideoUrl = (id: string, camera: string) =>
+  `/api/episode/video?id=${encodeURIComponent(id)}&camera=${encodeURIComponent(camera)}`;
+
 export const previewUrl = (camera: string, width: number, height: number, nonce: number) =>
   `/api/preview.png?camera=${camera}&w=${width}&h=${height}&n=${nonce}`;

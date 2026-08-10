@@ -149,6 +149,21 @@ AVFoundation(PyObjC) 0=FaceTime 1=OBS  2=DECXIN  3=DECXIN
 HEVC 还要显式打 `hvc1` tag:VideoToolbox 默认打 `hev1`,QuickTime / 预览 / Safari 对
 它支持很差。torchcodec 不在乎,但你双击一个 episode 想看一眼的时候在乎。
 
+## 回看:按帧号对齐,不是按时间戳
+
+数据集页把两路相机和轨迹曲线放在一起,共用一个游标:点曲线定位视频,播放视频时游标
+跟着走。
+
+**对齐用的是帧号,不是时间戳**,这一点必须清楚。录制时每个控制步写一帧,所以 video 帧
+*i* 就是 `frames.npz` 的第 *i* 行 —— 但文件的帧率写的是配置里的 `control_hz`(30),
+而回路实跑只有 26 Hz 左右。实测 `ep_20260810_232308`:501 帧,录制时长 **19.22 s**,
+视频文件时长 **16.70 s**,差 2.52 s。按时间戳对齐的话,片尾会错开两秒半 —— 对一条抓取
+演示来说这是致命的。帧号才是两边真正共享的坐标。
+
+视频通过 `/api/episode/video?id=...&camera=...` 提供,**实现了 Range 请求**。这不是可选
+的:`<video>` 元素拿不到 byte range 就没法拖动进度条,而一条只能从头播的 episode 视频
+对回看毫无用处。标准库的 `SimpleHTTPRequestHandler` 不做 Range,所以是自己写的。
+
 ## GL 后端 / 相机预览
 
 启动时网关会打出它选了哪个,以及凭什么:
@@ -209,7 +224,7 @@ renderer 把 GL context 绑在**构造它的那条线程**上。于是「谁请�
 | 页面 | 做什么 |
 |---|---|
 | 遥操作 / 录制 | 选 backend/source 起会话;实时看回路频率、IK 误差、限幅标志、关节指令 vs 实测、仿真相机;一次会话里连续录多条 |
-| 数据集 | 列出 `data/episodes/`,看单条的轨迹曲线和指标,补标注,删除 |
+| 数据集 | 列出 `data/episodes/`,两路相机与轨迹曲线共用一个游标对齐回看,补标注,删除 |
 | 回放 | joint / task 两种模式回放到 mock / mujoco / real,带静态检查、接近首帧、限速与偏差统计 |
 | 进度 | 蓝图各模块的状态与 TODO,数据来自 `so_snake/gui/roadmap.py` |
 

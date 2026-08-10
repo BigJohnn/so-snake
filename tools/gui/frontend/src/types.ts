@@ -188,6 +188,14 @@ export interface EpisodeMeta {
   joint_names: string[];
   summary: Record<string, number>;
   aborted_reason: string;
+  /** Empty for an episode recorded without cameras. */
+  video: {
+    encoder?: { codec: string; reason: string; hardware: boolean };
+    cameras?: Record<string, {
+      file: string; width: number; height: number;
+      written: number; dropped: number; stale: number; error: string;
+    }>;
+  };
 }
 
 export interface EpisodeDetail {

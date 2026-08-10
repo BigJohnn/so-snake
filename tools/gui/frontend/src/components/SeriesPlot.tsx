@@ -41,6 +41,12 @@ interface Props {
   bands?: Band[];
   /** Shown when there is nothing to draw yet. */
   placeholder?: string;
+  /** A pinned position, in sample index. Drawn distinctly from the hover line:
+   *  this one is where the video is, and it stays put when the pointer leaves. */
+  cursor?: number | null;
+  /** Called with a sample index when the plot is clicked, so a click can seek
+   *  the video the plot is aligned with. */
+  onScrub?: (index: number) => void;
 }
 
 const PAD = { top: 8, right: 10, bottom: 16, left: 44 };
@@ -73,7 +79,9 @@ export function SeriesPlot({
   yMax,
   reference,
   bands,
-  placeholder = "no data yet"
+  placeholder = "no data yet",
+  cursor = null,
+  onScrub
 }: Props) {
   const [width, setWidth] = useState(600);
   const [hover, setHover] = useState<number | null>(null);
@@ -195,6 +203,16 @@ export function SeriesPlot({
           setHover(i >= 0 && i < n ? i : null);
         }}
         onMouseLeave={() => setHover(null)}
+        onClick={
+          onScrub
+            ? (event) => {
+                const rect = event.currentTarget.getBoundingClientRect();
+                const i = Math.round(((event.clientX - rect.left - PAD.left) / plotW) * (n - 1));
+                if (i >= 0 && i < n) onScrub(i);
+              }
+            : undefined
+        }
+        style={onScrub ? { cursor: "pointer" } : undefined}
       >
         {(bands ?? []).flatMap((band, bi) =>
           bandRects(band.values).map((rect, ri) => (
@@ -255,6 +273,16 @@ export function SeriesPlot({
           />
         ))}
 
+        {cursor !== null && cursor >= 0 && cursor < x.length ? (
+          <line
+            x1={px(cursor)}
+            x2={px(cursor)}
+            y1={PAD.top}
+            y2={PAD.top + plotH}
+            stroke="var(--accent)"
+            strokeWidth={1.5}
+          />
+        ) : null}
         {hover !== null ? (
           <g>
             <line x1={px(hover)} x2={px(hover)} y1={PAD.top} y2={PAD.top + plotH} stroke="#8b97a6" strokeWidth={1} />

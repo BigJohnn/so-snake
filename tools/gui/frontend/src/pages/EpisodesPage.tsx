@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { ApiError, api } from "../api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ApiError, api, episodeVideoUrl } from "../api";
 import { SeriesPlot } from "../components/SeriesPlot";
 import { Banner, Card, Empty, Field, Pill, Stat } from "../components/ui";
 import type { EpisodeDetail, EpisodeMeta } from "../types";
@@ -138,6 +138,68 @@ export function EpisodesPage() {
   );
 }
 
+/** The episode's cameras, kept in step with the plots.
+ *
+ * Alignment is by **frame index, not by timestamp**. The recorder writes one
+ * video frame per control step, so video frame i is row i -- but the file's
+ * frame rate is the configured control_hz while the loop actually ran a little
+ * slower, so video time and recorded time drift apart over a take. Index is the
+ * coordinate both halves genuinely share.
+ *
+ * Both cameras play from one clock: the first is the timekeeper and the second
+ * is nudged back to it when they drift by more than a couple of frames, which
+ * is what keeps a wrist view and a scene view showing the same instant.
+ */
+function EpisodeVideos({
+  id,
+  cameras,
+  fps,
+  index,
+  onIndex
+}: {
+  id: string;
+  cameras: string[];
+  fps: number;
+  index: number;
+  onIndex: (i: number) => void;
+}) {
+  const refs = useRef<Record<string, HTMLVideoElement | null>>({});
+
+  // Seeking is driven from outside (a click on a plot); playing is driven from
+  // inside (the element's own clock). Only jump when the two disagree by more
+  // than a couple of frames, or every timeupdate would fight the playback.
+  useEffect(() => {
+    const want = index / fps;
+    for (const video of Object.values(refs.current)) {
+      if (video && Math.abs(video.currentTime - want) > 2 / fps) video.currentTime = want;
+    }
+  }, [index, fps]);
+
+  return (
+    <div className={`grid${cameras.length > 1 ? " cols-2" : ""}`}>
+      {cameras.map((role, i) => (
+        <div className="preview" key={role}>
+          <video
+            ref={(node) => {
+              refs.current[role] = node;
+            }}
+            src={episodeVideoUrl(id, role)}
+            controls={i === 0}
+            muted
+            preload="metadata"
+            onTimeUpdate={
+              i === 0
+                ? (event) => onIndex(Math.round(event.currentTarget.currentTime * fps))
+                : undefined
+            }
+          />
+          <div className="tag">{role}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Detail({
   detail,
   joint,
@@ -161,6 +223,17 @@ function Detail({
 
   const s = detail.series;
   const jointNames = detail.meta.joint_names.filter((n) => n !== "gripper");
+
+  // Row index into the full recording. The plots are decimated by `stride`, so
+  // a plot sample maps to a row by multiplying and back by dividing; keeping
+  // the shared cursor in row space means the video does not inherit the plots'
+  // resolution.
+  const [row, setRow] = useState(0);
+  useEffect(() => setRow(0), [detail.meta.id]);
+  const videoCameras = Object.keys(detail.meta.video?.cameras ?? {});
+  const fps = detail.meta.control_hz || 30;
+  const cursor = Math.round(row / Math.max(1, s.stride));
+  const scrub = (i: number) => setRow(i * s.stride);
   const column = (rows: number[][], index: number) => rows.map((row) => row[index]);
 
   return (
@@ -217,8 +290,30 @@ function Detail({
         </Card>
       </div>
 
+      {videoCameras.length ? (
+        <Card
+          title="相机"
+          actions={
+            <span className="dim small">
+              第 {row + 1} / {detail.meta.n_steps} 帧 · t = {(s.t[Math.min(cursor, s.t.length - 1)] ?? 0).toFixed(2)} s
+              {" · "}点击下方曲线可定位
+            </span>
+          }
+        >
+          <EpisodeVideos
+            id={detail.meta.id}
+            cameras={videoCameras}
+            fps={fps}
+            index={row}
+            onIndex={setRow}
+          />
+        </Card>
+      ) : null}
+
       <Card title={`轨迹 · ${detail.meta.id}`}>
         <SeriesPlot
+          cursor={videoCameras.length ? cursor : null}
+          onScrub={videoCameras.length ? scrub : undefined}
           x={s.t}
           series={[
             { label: "x", values: column(s.task_target, 0) },
@@ -230,6 +325,8 @@ function Detail({
           height={130}
         />
         <SeriesPlot
+          cursor={videoCameras.length ? cursor : null}
+          onScrub={videoCameras.length ? scrub : undefined}
           x={s.t}
           series={[
             { label: "pitch", values: column(s.task_target, 3).map(toDeg) },
