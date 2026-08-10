@@ -20,7 +20,6 @@ export function TeleopPage({
   const [rig, setRig] = useState<RigState>(DEFAULT_RIG);
   const [name, setName] = useState("");
   const [task, setTask] = useState("");
-  const [camera, setCamera] = useState("third_person");
 
   const mode = snapshot?.mode ?? "idle";
   const idle = mode === "idle";
@@ -29,7 +28,18 @@ export function TeleopPage({
   const blocked = rigReady(rig, config);
 
   const series = useSeries(mode !== "idle");
-  const previewOn = teleop && (snapshot?.spec?.backend ?? "") === "mujoco";
+  // Every role that something can fill: a real camera opened for it, or the
+  // simulator's camera of the same name. The real one wins on the server side,
+  // so this only decides which panes are worth asking for.
+  const liveCameras = snapshot?.cameras?.connected ?? [];
+  const simCameras = (snapshot?.spec?.backend ?? "") === "mujoco" ? config.cameras : [];
+  const panes = config.cameras.filter(
+    (role) => liveCameras.includes(role) || simCameras.includes(role)
+  );
+  const previewOn = teleop && panes.length > 0;
+  // 8 fps. The gateway throttles to 10 and serves the cache in between, so
+  // asking faster would only spend CPU that the video encoder wants while a
+  // take is recording.
   const tick = useTicker(120, previewOn);
 
   const latest = (snapshot?.latest ?? {}) as Partial<Telemetry>;
@@ -267,32 +277,32 @@ export function TeleopPage({
         </Card>
 
         <div className="grid cols-2">
-          <Card
-            title="仿真相机"
-            actions={
-              <div className="row">
-                {config.cameras.map((cam) => (
-                  <button
-                    key={cam}
-                    className={`btn small${camera === cam ? " primary" : ""}`}
-                    onClick={() => setCamera(cam)}
-                  >
-                    {cam}
-                  </button>
-                ))}
-              </div>
-            }
-          >
+          <Card title="相机">
             {previewOn ? (
-              <div className="preview">
-                <img src={previewUrl(camera, 640, 480, tick)} alt={`${camera} 相机`} />
-                <div className="tag">{camera}</div>
+              // Both roles at once rather than one behind a selector: the
+              // operator is judging the wrist against the scene, and a toggle
+              // makes that a memory test. Each pane is its own throttled key
+              // on the gateway, so two panes cost two cached renders a second,
+              // not two renders per poll.
+              <div className={`grid${panes.length > 1 ? " cols-2" : ""}`}>
+                {panes.map((role) => (
+                  <div className="preview" key={role}>
+                    <img
+                      src={previewUrl(role, 480, 360, tick)}
+                      alt={`${role} 相机`}
+                      loading="lazy"
+                    />
+                    <div className="tag">
+                      {liveCameras.includes(role) ? `${role} · 实拍` : `${role} · 仿真`}
+                    </div>
+                  </div>
+                ))}
               </div>
             ) : (
               <Empty>
-                {snapshot?.spec?.backend === "real"
-                  ? "真机相机采集尚未接入 (见「进度」页)"
-                  : "仅 mujoco backend 有仿真相机"}
+                {!teleop
+                  ? "启动一个会话以查看画面"
+                  : "没有可显示的相机:在左侧扫描并指派,或用 mujoco backend 看仿真相机"}
               </Empty>
             )}
           </Card>

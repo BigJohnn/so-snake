@@ -15,6 +15,14 @@ is seconds to a couple of minutes -- a few thousand rows of a few hundred bytes
 -- so the buffer is small, and writing once means an episode directory is either
 complete or absent, never a truncated file that looks fine until training. The
 `max_steps` cap is the backstop for a recording someone forgot to stop.
+
+Video cannot be buffered the same way and is not: 1080p RGB is 6 MB a frame, so
+two cameras over a two-minute take would be 43 GB of RAM. Frames stream to disk
+through `data.video` as they arrive, one per control step per camera, which is
+also what keeps video frame *i* aligned with row *i*. The consequence is that
+the episode directory exists, holding video, while the take is still running --
+harmless, because the store treats a directory without `meta.json` as
+incomplete and skips it, and `meta.json` is still written last.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from .episode import (
     utc_now_iso,
     write_episode,
 )
+from .video import VideoConfig, VideoSet, VideoWriter, select_encoder
 
 # 30 minutes at 30 Hz. Anything longer is a session, not a demonstration.
 DEFAULT_MAX_STEPS = 54_000
@@ -77,6 +86,8 @@ class EpisodeRecorder:
         simulated: bool = True,
         joint_names: tuple[str, ...] = (),
         max_steps: int = DEFAULT_MAX_STEPS,
+        cameras: Any = None,
+        video: VideoConfig | None = None,
     ) -> None:
         self.root = Path(root)
         self.config = config or SoSnakeConfig()
@@ -85,11 +96,18 @@ class EpisodeRecorder:
         self.simulated = simulated
         self.joint_names = tuple(joint_names)
         self.max_steps = int(max_steps)
+        # Duck-typed rather than a `CameraRig` import: all that is wanted here
+        # is `roles` and `read_latest(role)`, and keeping `data` free of a
+        # dependency on `m0_perception` means the offline gates never drag in
+        # lerobot to read an episode.
+        self.cameras = cameras
+        self.video_config = video or self.config.video
 
         self._lock = threading.Lock()
         self._records: list[StepRecord] = []
         self._meta: EpisodeMeta | None = None
         self._aborted_reason = ""
+        self._video: VideoSet | None = None
 
     # ------------------------------------------------------------------ state
 
@@ -151,7 +169,47 @@ class EpisodeRecorder:
                 config=config_snapshot(self.config),
             )
             self._meta = meta
+            self._video = self._open_video(meta.id)
             return meta
+
+    def _open_video(self, episode_id: str) -> VideoSet | None:
+        """Open one file per camera that is delivering frames, or None.
+
+        A camera that has not produced a frame yet is left out rather than
+        waited for: its size is unknown, and blocking the operator's "record"
+        press on a device that may never answer is worse than an episode that
+        says which cameras it has.
+
+        Encoder failure aborts the recording before it starts. Silently
+        recording without video would be discovered when someone opens the
+        episode expecting to see the workspace.
+        """
+        if self.cameras is None or not getattr(self.cameras, "roles", ()):
+            return None
+
+        available: dict[str, tuple[int, int]] = {}
+        for role in self.cameras.roles:
+            frame = self.cameras.read_latest(role)
+            if frame is not None:
+                available[role] = (int(frame.shape[1]), int(frame.shape[0]))
+        if not available:
+            return None
+
+        width, height = next(iter(available.values()))
+        choice = select_encoder(self.video_config, width=width, height=height)
+        directory = self.root / episode_id
+        writers = {
+            role: VideoWriter(
+                directory / f"{role}.mp4",
+                choice,
+                size[0],
+                size[1],
+                self.config.teleop.control_hz,
+                self.video_config,
+            )
+            for role, size in available.items()
+        }
+        return VideoSet(choice=choice, writers=writers)
 
     def append(self, record: StepRecord) -> None:
         """Called once per control step. Never raises into the control loop."""
@@ -162,6 +220,12 @@ class EpisodeRecorder:
                 self._aborted_reason = f"step cap reached ({self.max_steps})"
                 return
             self._records.append(record)
+            video = self._video
+
+        # Outside the lock: `submit` only hands the frame to a queue, but the
+        # camera read and this call have no business holding up `status()`.
+        if video is not None and self.cameras is not None:
+            video.submit({role: self.cameras.read_latest(role) for role in video.writers})
 
     def abort(self, reason: str) -> None:
         """Flag the open episode as having ended badly. Does not close it."""
@@ -177,14 +241,26 @@ class EpisodeRecorder:
         moment they know is far better than filtering later from a spreadsheet.
         """
         with self._lock:
-            meta, records = self._meta, self._records
+            meta, records, video = self._meta, self._records, self._video
             reason = self._aborted_reason
             self._meta, self._records, self._aborted_reason = None, [], ""
+            self._video = None
 
         if meta is None:
             return None
         if not keep or not records:
+            # The directory may already hold video from this take. It goes with
+            # the take: a discarded demonstration must not leave footage behind
+            # that the store would later find without a `meta.json` to explain.
+            if video is not None:
+                video.discard()
+            directory = self.root / meta.id
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
             return None
+
+        if video is not None:
+            meta.video = video.close()
 
         stats = LoopStats()
         for record in records:

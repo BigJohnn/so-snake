@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ARM_JOINTS, GRIPPER_JOINT, REPO_ROOT, SoSnakeConfig
+from .m0_perception import CAMERA_ROLES, CameraRig, CameraSpec, cameras_import_error
 from .m4_execution.backends import MockFollower, RobotBackend
 from .teleop.sources import ScriptedSource, TeleopSource
 
@@ -55,6 +56,12 @@ class RigSpec:
     max_relative_target_deg: float = 5.0
     gripper_speed_mult: float = 3.0
 
+    # -- cameras ------------------------------------------------------------
+    # Empty means "no cameras this session", which is the right default: a
+    # session that does not need them should not be opening devices, and a
+    # camera that is present but unassigned is not a camera anyone asked for.
+    cameras: tuple[CameraSpec, ...] = ()
+
     # -- controller only ----------------------------------------------------
     device_id: int | None = None
 
@@ -77,6 +84,11 @@ class RigSpec:
             raise ValueError("the real backend needs --port")
         if self.max_relative_target_deg <= 0 or self.gripper_speed_mult <= 0:
             raise ValueError("max_relative_target_deg and gripper_speed_mult must be positive")
+        roles = [camera.role for camera in self.cameras]
+        if len(set(roles)) != len(roles):
+            raise ValueError(f"two cameras claim the same role: {roles}")
+        for camera in self.cameras:
+            camera.validate()
 
 
 def build_backend(spec: RigSpec, config: SoSnakeConfig | None = None) -> RobotBackend:
@@ -146,6 +158,17 @@ def build_source(spec: RigSpec, config: SoSnakeConfig | None = None) -> TeleopSo
     return NintendoProSource(controller="pro", device_id=spec.device_id)
 
 
+def build_cameras(spec: RigSpec) -> CameraRig:
+    """Construct the camera rig `spec` names. Does not open any device.
+
+    Always returns a rig, empty when no cameras were assigned, so callers do not
+    branch on None to decide whether they have cameras -- an empty rig connects,
+    reads and disconnects like any other, it just has nothing to show.
+    """
+    spec.validate()
+    return CameraRig(spec.cameras)
+
+
 def _importable(module: str) -> bool:
     from importlib.util import find_spec
 
@@ -187,6 +210,18 @@ def availability() -> dict[str, Any]:
     has_lerobot = _importable("lerobot")
     has_servo_sdk = _importable("scservo_sdk")
     joint_map_exists = DEFAULT_JOINT_MAP.is_file()
+    # By spec, not by import, for the same reason lerobot is: `cameras_import_error`
+    # imports lerobot.cameras for real, and this function is polled by a config
+    # page that must not pay for torch. The real reason surfaces at connect.
+    camera_error = "; ".join(
+        filter(
+            None,
+            [
+                "" if has_lerobot else "lerobot not installed (.[teleop] extra)",
+                "" if _importable("cv2") else "opencv not installed (comes with lerobot)",
+            ],
+        )
+    )
 
     def entry(ok: bool, reason: str = "") -> dict[str, Any]:
         return {"available": ok, "reason": "" if ok else reason}
@@ -212,6 +247,11 @@ def availability() -> dict[str, Any]:
         "sources": {
             "scripted": entry(True),
             "pro": entry(has_lerobot, "lerobot not installed (.[teleop] extra)"),
+        },
+        "cameras": {
+            "available": not camera_error,
+            "reason": camera_error,
+            "roles": list(CAMERA_ROLES),
         },
         "joint_map_path": str(DEFAULT_JOINT_MAP),
         "joint_map_present": joint_map_exists,

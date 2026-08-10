@@ -66,12 +66,44 @@ export interface ReplayStatus {
   summary: Record<string, number>;
 }
 
+export type CameraRole = "third_person" | "wrist";
+
+/** One camera attached to this machine, as reported by /api/cameras.
+ *
+ * `name` is empty on macOS on purpose -- the OpenCV index cannot be mapped to a
+ * device name there. `thumbnail` is what the operator identifies it by.
+ */
+export interface CameraDevice {
+  index: number;
+  /** What to send back as this camera's device: a stable path where the
+   *  platform has one (Linux /dev/v4l/by-id), otherwise the bare index. */
+  device: number | string;
+  /** True when `device` survives a replug. False means the index is only good
+   *  until the set of connected cameras changes. */
+  stable: boolean;
+  /** "usb" where the platform actually says so (Linux by-id); "" where it
+   *  cannot be known without guessing (macOS). Never inferred. */
+  bus: string;
+  name: string;
+  width: number;
+  height: number;
+  thumbnail: string;
+}
+
+/** Which cameras a session asked for, and which of them actually opened. */
+export interface CameraStatus {
+  roles: string[];
+  devices: Record<string, number | string>;
+  connected: string[];
+}
+
 export interface SpecStatus {
   backend: BackendKind;
   source: SourceKind;
   port: string;
   physical: boolean;
   max_relative_target_deg: number;
+  cameras: Record<string, number | string>;
 }
 
 export interface EventItem {
@@ -88,6 +120,7 @@ export interface Snapshot {
   connected: boolean;
   steps: number;
   latest: Telemetry | Record<string, never>;
+  cameras: CameraStatus;
   recording: RecordingStatus;
   replay: ReplayStatus;
   events: EventItem[];
@@ -107,6 +140,7 @@ export interface SeriesRow {
 export interface Availability {
   backends: Record<BackendKind, { available: boolean; reason: string }>;
   sources: Record<SourceKind, { available: boolean; reason: string }>;
+  cameras: { available: boolean; reason: string; roles: CameraRole[] };
   joint_map_path: string;
   joint_map_present: boolean;
 }

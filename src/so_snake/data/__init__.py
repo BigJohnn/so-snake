@@ -28,12 +28,22 @@ from .replay import (
     inspect_episode,
 )
 from .store import EpisodeStore
+from .video import (
+    EncoderChoice,
+    VideoConfig,
+    VideoSet,
+    VideoStats,
+    VideoWriter,
+    probe_encoder,
+    select_encoder,
+)
 
 __all__ = [
     "COLUMN_NAMES",
     "DEFAULT_EPISODE_ROOT",
     "FORMAT_VERSION",
     "REPLAY_MODES",
+    "EncoderChoice",
     "Episode",
     "EpisodeMeta",
     "EpisodeRecorder",
@@ -43,10 +53,16 @@ __all__ = [
     "ReplayConfig",
     "ReplayReport",
     "ReplayStep",
+    "VideoConfig",
+    "VideoSet",
+    "VideoStats",
+    "VideoWriter",
     "config_snapshot",
     "encode_frames",
     "inspect_episode",
+    "probe_encoder",
     "read_episode",
     "read_meta",
+    "select_encoder",
     "write_episode",
 ]

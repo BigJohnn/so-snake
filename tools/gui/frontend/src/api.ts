@@ -1,6 +1,7 @@
 import type {
   AppConfig,
   BackendKind,
+  CameraDevice,
   EpisodeDetail,
   EpisodeMeta,
   ReplayMode,
@@ -65,6 +66,8 @@ export interface RigBody {
   max_relative_target_deg?: number;
   amplitude?: number;
   rotation_amplitude?: number;
+  /** Role -> device index or path. Omitted roles are simply not opened. */
+  cameras?: Record<string, number | string>;
 }
 
 export const api = {
@@ -73,6 +76,11 @@ export const api = {
   snapshot: () => request<Snapshot>("/api/snapshot"),
   series: (limit = 600) =>
     request<{ series: SeriesRow[] }>(`/api/series?limit=${limit}`).then((r) => r.series),
+
+  // Slow (opens every device), so this is called on demand from the rig
+  // controls and never polled.
+  cameras: () =>
+    request<{ devices: CameraDevice[]; roles: string[] }>("/api/cameras").then((r) => r.devices),
 
   episodes: () => request<{ episodes: EpisodeMeta[] }>("/api/episodes").then((r) => r.episodes),
   episode: (id: string) => request<EpisodeDetail>(`/api/episode?id=${encodeURIComponent(id)}`),

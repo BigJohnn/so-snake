@@ -169,6 +169,17 @@ class EpisodeMeta:
     config: dict[str, Any] = field(default_factory=dict)
     summary: dict[str, float] = field(default_factory=dict)
 
+    # The camera files, the encoder that produced them, and *why* that encoder
+    # was chosen -- the choice is made per machine, so an episode that looks
+    # worse than its neighbours should not need guessing about. Also carries the
+    # per-camera written/dropped/stale counts: a video shorter than `n_steps`
+    # has lost its row alignment, and that has to be legible from the metadata
+    # rather than discovered by a training run.
+    #
+    # Empty for an episode recorded without cameras, which is every episode
+    # before this field existed.
+    video: dict[str, Any] = field(default_factory=dict)
+
     # Set when a recording ends for a reason other than the operator asking it
     # to -- a full disk, a step cap, a backend that dropped out. An episode with
     # this set is still readable; it is just not necessarily a complete demo.
@@ -191,6 +202,7 @@ class EpisodeMeta:
             "joint_names": list(self.joint_names),
             "config": self.config,
             "summary": self.summary,
+            "video": self.video,
             "aborted_reason": self.aborted_reason,
         }
 

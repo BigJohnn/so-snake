@@ -42,8 +42,9 @@ from ..data import (
     ReplayStep,
     inspect_episode,
 )
+from ..m0_perception import CameraRig, frame_for_preview
 from ..m4_execution.motion import move_to_joints
-from ..rig import RigSpec, build_backend, build_source
+from ..rig import RigSpec, build_backend, build_cameras, build_source
 from ..teleop.loop import StepRecord, TeleopLoop
 from .preview import SimPreview
 
@@ -149,9 +150,14 @@ class SessionManager:
         self._lock = threading.RLock()
         self._backend_lock = threading.Lock()
         self._preview_lock = threading.Lock()
-        self._preview: tuple[tuple[str, int, int] | None, float, np.ndarray | None] = (None, 0.0, None)
+        # Keyed by (camera, width, height) rather than a single slot: the page
+        # shows both cameras at once, so a one-entry cache would be missed by
+        # every request as the two panes alternate, and the throttle it exists
+        # to enforce would never bind.
+        self._preview: dict[tuple[str, int, int], tuple[float, np.ndarray]] = {}
         self._sim_preview: SimPreview | None = None
         self._sim_preview_model: Any = None
+        self._cameras: CameraRig | None = None
 
         self._mode = "idle"
         self._spec: RigSpec | None = None
@@ -206,6 +212,9 @@ class SessionManager:
                 "connected": bool(self._backend is not None and self._backend.is_connected),
                 "steps": self._loop.stats.total_steps if self._loop else 0,
                 "latest": dict(self._latest),
+                # Which cameras are actually open, not which ones were asked
+                # for: the difference is the whole point of showing it.
+                "cameras": self._cameras.status() if self._cameras else _idle_cameras(),
                 "recording": self._recorder.status() if self._recorder else _idle_recording(),
                 "replay": dict(self._replay),
                 "events": [event.to_json() for event in list(self._events)[-40:]],
@@ -226,6 +235,7 @@ class SessionManager:
 
             backend = LockedBackend(build_backend(spec, self.config), self._backend_lock)
             source = build_source(spec, self.config)
+            cameras = build_cameras(spec)
             loop = TeleopLoop(source, backend, self.config, stats_capacity=SERIES_CAPACITY)
             recorder = EpisodeRecorder(
                 self.store.root,
@@ -234,10 +244,11 @@ class SessionManager:
                 source=spec.source,
                 simulated=not spec.is_physical,
                 joint_names=backend.joint_names,
+                cameras=cameras,
             )
 
             self._spec, self._backend, self._source = spec, backend, source
-            self._loop, self._recorder = loop, recorder
+            self._loop, self._recorder, self._cameras = loop, recorder, cameras
             self._latest, self._error = {}, ""
             self._series.clear()
             self._mode = "teleop"
@@ -251,6 +262,16 @@ class SessionManager:
     def _run_teleop(self) -> None:
         assert self._loop is not None
         try:
+            # On the worker, for the same reason the backend and the source
+            # connect there: opening two USB cameras takes seconds, and the
+            # HTTP request that started the session should not be holding a
+            # socket open through it. A failure here reaches the UI through
+            # `_spawn`'s handler, the same way a backend that will not connect
+            # does.
+            cameras = self._cameras
+            if cameras is not None and cameras.specs:
+                cameras.connect()
+                self.log("info", f"cameras open: {', '.join(cameras.roles)}")
             self._loop.run(
                 realtime=True,
                 on_step=self._on_teleop_step,
@@ -449,26 +470,63 @@ class SessionManager:
     # ------------------------------------------------------------------ preview
 
     def preview_frame(self, camera: str, width: int, height: int) -> np.ndarray | None:
-        """Render the simulator's current state, or None if there is nothing to render.
+        """What `camera` currently sees, or None if nothing can answer that.
 
-        Only the state copy touches the backend lock; the draw runs against
-        `SimPreview`'s own `MjData` on its own GL thread, so an open browser
-        preview cannot slow the control loop down. Frames are additionally
-        throttled, which makes two open tabs cost one render rather than two.
+        A real camera assigned to this role wins over the simulator. That order
+        is deliberate rather than alphabetical: the two are never both worth
+        showing -- if there is a physical camera pointed at the workspace, a
+        render of the model is the less true picture -- and it means the same
+        pane, at the same URL, shows the real thing as soon as one is plugged
+        in and assigned.
 
-        A backend with no simulator behind it -- the mock, the real arm -- has
-        nothing to show, and says so by returning None.
+        Neither path can slow the control loop. A camera read is a peek at what
+        the capture thread already put down (microseconds, no device I/O). For
+        the simulator, only the state copy touches the backend lock; the draw
+        runs against `SimPreview`'s own `MjData` on its own GL thread. Frames
+        are additionally throttled, which makes two open tabs cost one render
+        rather than two.
+
+        None means there is nothing to show at all -- no camera in that role and
+        no simulator behind the backend, which is the mock's and the bare real
+        arm's situation.
         """
         with self._lock:
             backend = self._backend
+            cameras = self._cameras
+
+        key = (camera, width, height)
+        now = time.perf_counter()
+
+        with self._preview_lock:
+            cached = self._preview.get(key)
+            if cached is not None and now - cached[0] < PREVIEW_MIN_INTERVAL_S:
+                return cached[1]
+
+            # Throttled before the work, not after: scaling a 1080p frame down
+            # and deflating it into a PNG is tens of milliseconds of CPU, and
+            # while a take is recording that CPU is wanted by the encoder
+            # thread. Two panes polling at 10 Hz would otherwise cost twenty
+            # rescales a second for pictures nobody can tell apart.
+            frame = self._render_preview(camera, width, height, backend, cameras)
+            if frame is None:
+                return None
+            self._preview[key] = (time.perf_counter(), frame)
+            return frame
+
+    def _render_preview(
+        self, camera: str, width: int, height: int, backend: Any, cameras: Any
+    ) -> np.ndarray | None:
+        """Produce one preview frame. Called with `_preview_lock` held."""
+        if cameras is not None:
+            frame = cameras.read_latest(camera)
+            if frame is not None:
+                return frame_for_preview(frame, width, height)
+
         if backend is None:
             return None
         sim = getattr(backend.inner, "sim", None)
         if sim is None:
             return None
-
-        key = (camera, width, height)
-        now = time.perf_counter()
 
         def capture(dest: Any) -> None:
             # Runs on SimPreview's GL thread. The backend lock is held for a
@@ -477,18 +535,12 @@ class SessionManager:
                 dest.qpos[:] = sim.data.qpos
                 dest.qvel[:] = sim.data.qvel
 
-        with self._preview_lock:
-            cached_key, cached_at, cached = self._preview
-            if cached is not None and cached_key == key and now - cached_at < PREVIEW_MIN_INTERVAL_S:
-                return cached
-            if self._sim_preview is None or self._sim_preview_model is not sim.model:
-                if self._sim_preview is not None:
-                    self._sim_preview.close()
-                self._sim_preview = SimPreview(sim.model)
-                self._sim_preview_model = sim.model
-            frame = self._sim_preview.frame(camera, width, height, capture)
-            self._preview = (key, time.perf_counter(), frame)
-            return frame
+        if self._sim_preview is None or self._sim_preview_model is not sim.model:
+            if self._sim_preview is not None:
+                self._sim_preview.close()
+            self._sim_preview = SimPreview(sim.model)
+            self._sim_preview_model = sim.model
+        return self._sim_preview.frame(camera, width, height, capture)
 
     # ------------------------------------------------------------------ private
 
@@ -512,6 +564,8 @@ class SessionManager:
         """Return to idle: close an open recording, drop the devices, release torque."""
         with self._lock:
             recorder, source, backend = self._recorder, self._source, self._backend
+            cameras = self._cameras
+            self._cameras = None
             was = self._mode
             self._mode = "idle"
             # The spec goes too. Leaving it set makes the UI show a backend and a
@@ -531,7 +585,7 @@ class SessionManager:
             if self._sim_preview is not None:
                 self._sim_preview.close()
             self._sim_preview, self._sim_preview_model = None, None
-            self._preview = (None, 0.0, None)
+            self._preview.clear()
 
         if recorder is not None and recorder.is_recording:
             # An episode open when the session ends is still evidence -- of a
@@ -542,7 +596,11 @@ class SessionManager:
             if written is not None:
                 self.log("warn", f"session ended mid-recording; kept {written.id}")
 
-        for closer in (getattr(source, "disconnect", None), getattr(backend, "disconnect", None)):
+        for closer in (
+            getattr(cameras, "disconnect", None),
+            getattr(source, "disconnect", None),
+            getattr(backend, "disconnect", None),
+        ):
             if closer is None:
                 continue
             try:
@@ -567,6 +625,10 @@ def _idle_recording() -> dict[str, Any]:
             "duration_s": 0.0, "aborted_reason": ""}
 
 
+def _idle_cameras() -> dict[str, Any]:
+    return {"roles": [], "devices": {}, "connected": []}
+
+
 def _idle_replay() -> dict[str, Any]:
     return {"active": False, "phase": "idle", "episode_id": "", "mode": "", "speed": 1.0,
             "step": 0, "total": 0, "approach_remaining_deg": 0.0, "completed": False,
@@ -582,6 +644,7 @@ def _spec_json(spec: RigSpec | None) -> dict[str, Any] | None:
         "port": spec.port,
         "physical": spec.is_physical,
         "max_relative_target_deg": spec.max_relative_target_deg,
+        "cameras": {camera.role: camera.index_or_path for camera in spec.cameras},
     }
 
 

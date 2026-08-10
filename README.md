@@ -167,6 +167,21 @@ PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --check   
 PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --backend mujoco --mode task
 ```
 
+有相机时每个视角多一个 `<role>.mp4`,**每个控制步写一帧**,所以 video 帧 *i* 就是
+`frames.npz` 的第 *i* 行 —— 相机没有新帧就重写上一帧(计入 `stale`),队列满了才丢
+(计入 `dropped`),两个数都写进 `meta.json`,因为一条视频比 `n_steps` 短就意味着对齐
+断了,这件事必须从元数据看得出来,而不是等训练时才发现。
+
+编码器**不设全局默认,按机器探测选**。实测两路 1080p30:`hevc_videotoolbox` 要 0.30
+核、1.67 Mbps;`libsvtav1` 要 1.44 核、0.52 Mbps,画质相同(43.0 / 42.8 dB)。硬编码
+省 4.8 倍 CPU,软编码省 3.2 倍磁盘,所以选哪个取决于这台机器缺什么 —— 核数少于
+`hw_core_threshold`(默认 8)就用硬编码,否则用软编码。`VideoConfig.codec` 可以直接
+点名覆盖。选中的编码器**和理由**都写进 `meta.json`。
+
+探测方式是**真编几帧**,不是构造一下编码器对象:`av.codec.Codec(name, "w")` 只说明
+它被编译进来了,没有 NVIDIA 驱动的机器上 NVENC 照样构造成功,然后在录制第一帧时炸。
+这跟 `probe_gl_backend` 是同一个道理。
+
 回放有两种模式,回答的是不同问题:
 
 | 模式 | 问题 | 偏差说明什么 |
@@ -182,6 +197,12 @@ PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --backend 
 ## Web GUI
 
 ```bash
+scripts/run_gui.sh          # 装前端依赖(仅首次)、按需构建、起服务、开浏览器
+```
+
+分步版本,或者想自己控制的时候:
+
+```bash
 cd tools/gui/frontend && npm install && npm run build
 PYTHONPATH=src .venv/bin/python scripts/serve_gui.py     # http://localhost:8770
 ```
@@ -191,6 +212,16 @@ PYTHONPATH=src .venv/bin/python scripts/serve_gui.py     # http://localhost:8770
 [`tools/gui/README.md`](tools/gui/README.md)。
 
 默认只绑 `127.0.0.1`;`--host 0.0.0.0` 会把「让真臂动」的按钮暴露到网络上。
+
+真实 USB 相机在遥操作页「相机」一栏扫描并指派给腕部 / 第三人称视角,预览优先显示真
+相机,没指派才回落到 MuJoCo 仿真相机。采集走 lerobot 的 `OpenCVCamera`(cv2 是
+lerobot 的硬依赖,真机路径上本来就有),读帧是非阻塞 peek,实测不影响控制回路。
+
+**扫描给的是每个设备的缩略图,不是名字,按画面认。** macOS 上 OpenCV 的 index 既不
+对应 `system_profiler` 的顺序,也不对应 ffmpeg 的 AVFoundation 列表 —— 同一批相机三
+种枚举给出三种顺序,任何按位置推出来的名字都是猜的,而猜错是静默的(内置摄像头和 USB
+相机都是 1080p、都正常出帧)。细节见
+[`tools/gui/README.md`](tools/gui/README.md) 的「真实相机」一节。
 
 仿真相机预览要能渲染。启动时会打出选了哪个 GL 后端(egl → glfw → osmesa,子进程里
 真渲染一帧决定),`MUJOCO_GL` 已 export 则跳过探测。撞到 `EGLDeviceEXT` 报错、或者
@@ -213,23 +244,29 @@ M5 任务验证 —— lerobot 没有,由本仓库实现。
 
 ## 当前状态
 
-**阶段 0(基础搭建)进行中。** 硬件暂不在手边,策略是先写完整真机代码,配合
-Mock 后端离线验证整条链路,回家把后端切成真机即可。
+**阶段 0(基础搭建)基本完成,手柄→真机遥操已端到端跑通。** SO-100 已接入
+(macOS Apple Silicon),从 Pro 手柄到真机的整条链路实测通过:方向正确、松开
+clutch 即停(无运动尾巴)、夹爪可控、退出卸力。真机接入的关键决策与踩坑见
+[`docs/real_arm_bringup.md`](docs/real_arm_bringup.md)。
 
 - [x] 环境勘察,确认 lerobot 现成件可用
-- [x] SO-100 URDF 落地 + TCP 坐标系补全(见 [`docs/so100_vs_so101.md`](docs/so100_vs_so101.md))
+- [x] SO-100 URDF 落地 + TCP 坐标系补全(见 [`docs/so100_vs_so101.md`](docs/so100_vs_so101.md);上游来源已逐字节核对)
 - [x] FK/IK 离线验证通过(round-trip p95 = 0.078 mm / 0.004°)
 - [x] `T_world_base` 坐标系约定(零位时臂指向 −Y,已修正为 +X 朝前)
 - [x] 工作空间实测重推(继承的盒子只有 84% 可达,新盒子 100%)
 - [x] Mock 机器人后端 + 30Hz 闭环,离线跑通(位置误差中位 0.010 mm)
 - [x] **迁移到 5 维任务空间** —— `(x, y, z, pitch, roll)`,位置锚定 chart,atlas pitch clamp,5D DLS IK
 - [x] MuJoCo 3.6 仿真模型 + 三方运动学互校(ArmChain / placo / MuJoCo)
-- [x] Gate A/B 与默认闭环 desk check: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q` 88 passed; `scripts/check_teleop_loop.py --steps 300` PASS
+- [x] **MuJoCo viewer 支持 macOS Apple Silicon**:自动 re-exec 到 `mjpython`;手柄源自动选路(真 Pro 手柄,否则内置 scripted 波形)
+- [x] **真机接入**:只读 preflight、STS3215 标定、lerobot↔URDF 关节映射(`map_joint_frames.py` + `JointFrameMap`)、`SOFollowerBackend`、关节空间 move-to-start、`teleop_real_arm.py`
+- [x] **手柄→真机遥操跑通**:方向正确、松手无尾巴、夹爪 3× 速、退出落力矩、分层安全(先回 start / settle 中止 / 每步硬件钳位)
+- [x] Gate 与默认闭环 desk check: `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q` 88 passed; `scripts/check_teleop_loop.py --steps 300` PASS
 - [x] Episode 录制 + joint/task 双模式回放,含静态检查与限速/离地保护
 - [x] 本机 Web GUI:遥操作、录制、回放、进度看板
-- [ ] 双相机采集(GUI 已能实时预览 MuJoCo 双相机,但帧还没写进 episode)
+- [x] **真实 USB 双相机接入 GUI**:按缩略图指派视角(编号不可信,见上)、两路实时预览优先于仿真相机;采集在 lerobot 线程上,读帧 0.0014 ms,回路无损
+- [x] **相机帧写入 episode**:每个视角一个 mp4,编码在独立线程上,每控制步一帧保证 video 帧 i == npz 行 i;编码器按机器探测选(缺 CPU 用硬编,缺磁盘用软编),选中结果与理由写进 `meta.json`
 - [ ] LeRobotDataset 导出
-- [ ] **待实测**:舵机 ID/标定、TCP 实测校准、相机外参、clutch 手感调参
+- [ ] **待精修**:TCP 实测校准、offset 精修(标定欠扫的 pan/wrist_flex)、clutch/atlas 手感调参、相机外参
 
 ### 5 维任务空间迁移
 
@@ -245,19 +282,26 @@ orientation weight、placo IK retry 和 feasibility feedback 都已删除。
 
 ```
 assets/urdf/so100/     SO-100 URDF 与网格(so100.urdf 已补 TCP,so100_original.urdf 为上游原件)
+assets/atlas/          SO-100 可行性图集
+assets/mujoco/         MuJoCo XML 模型
+assets/so100_joint_map.json    lerobot↔URDF 每关节映射(本臂标定产物;map_joint_frames.py 生成)
+assets/so100_start_pose.json   记录的 start pose(本臂;move_to_start / teleop 起始)
 docs/                  设计决策记录
 scripts/               可复现的分析与验证脚本
 src/so_snake/          M0~M5 模块实现
-assets/atlas/          SO-100 可行性图集
-assets/mujoco/         MuJoCo XML 模型
 tools/gui/frontend/    Web GUI 前端(React + Vite;后端在 src/so_snake/gui/)
 data/episodes/         录制的 episode(不入版本库)
 ```
 
+`assets/so100_*.json` 是**这台臂**的标定/记录产物(舵机装配相关),换臂或重标定需重新生成。
+
 ## 脚本
+
+离线 / 仿真:
 
 | 脚本 | 用途 | 需要硬件 |
 |---|---|---|
+| `scripts/run_gui.sh` | 一键起 GUI:前端依赖/构建按需跑,再起 `serve_gui.py` | 否 |
 | `scripts/serve_gui.py` | 本机 Web GUI(遥操作 / 录制 / 回放 / 进度) | 否 |
 | `scripts/record_episode.py` | 录制一条 episode 到 `data/episodes/` | 视 backend |
 | `scripts/replay_episode.py` | 回放 episode(`--check` 只检查不动) | 视 backend |
@@ -268,8 +312,10 @@ data/episodes/         录制的 episode(不入版本库)
 | `scripts/build_mujoco_model.py` | 从 URDF/STL 生成 MuJoCo XML | 否 |
 | `scripts/compare_so100_so101.py` | SO-100/SO-101 运动学不变量比较 | 否 |
 | `scripts/derive_so100_tcp.py` | 从 SO-101 官方 TCP 推导 SO-100 TCP | 否 |
+| `scripts/view_pro_controller_sim.py` | MuJoCo viewer 遥操(macOS 自动 mjpython;手柄可选) | 否(需 `.[sim]`;真手柄需 `.[teleop]`) |
+| `scripts/check_pro_controller_sim.py` | 真手柄 → MuJoCo/Mock 无头闭环 | 手柄 |
 
-后两个需要上游仓库:
+`compare_so100_so101.py` 与 `derive_so100_tcp.py` 需要上游仓库:
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse \
@@ -277,3 +323,12 @@ git clone --depth 1 --filter=blob:none --sparse \
 (cd /tmp/soarm && git sparse-checkout set Simulation)
 export SOARM_UPSTREAM=/tmp/soarm
 ```
+
+真机(需 `.[teleop]` + 臂上电插好,详见「真机 preflight」与 `docs/real_arm_bringup.md`):
+
+| 脚本 | 用途 | 动臂? |
+|---|---|---|
+| `scripts/preflight_real_arm.py` | 依赖/关节契约/串口/手柄/标定检查;`--probe` 只读探测舵机 | 否(全程不动臂) |
+| `scripts/map_joint_frames.py` | 建立并核对 lerobot↔URDF 关节映射(`draft`/`signs`/`check`) | 否(手推,不上力矩) |
+| `scripts/move_to_start.py` | 关节空间移动到记录的 start pose | 是 |
+| `scripts/teleop_real_arm.py` | Pro 手柄 → TeleopLoop → 真机(先回 start,分层安全) | 是 |

@@ -204,3 +204,28 @@ td.num, th.num { font-family: var(--mono); text-align: right; }
 
 .plot { width: 100%; display: block; }
 .plot-title { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); margin-bottom: 3px; font-family: var(--mono); }
+
+/* Camera picking is done by looking at the thumbnails: on macOS a device index
+   carries no name, and two identical cameras differ only in what they see. */
+.camera-pick { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+.camera-choices { display: flex; gap: 6px; flex-wrap: wrap; }
+.camera-choice {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  padding: 3px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--panel); cursor: pointer;
+}
+.camera-choice img, .camera-choice-blank {
+  width: 96px; height: 54px; object-fit: cover; border-radius: 3px; display: block;
+}
+.camera-choice-blank { background: #1a1a22; }
+.camera-choice span { font-size: 11px; opacity: 0.75; }
+.camera-choice.picked { border-color: var(--accent); }
+.camera-choice.picked span { opacity: 1; color: var(--accent); }
+.camera-choice:disabled { opacity: 0.5; cursor: default; }
+.camera-choice-wrap { position: relative; display: inline-block; }
+.camera-choice-wrap.dimmed { opacity: 0.45; }
+.camera-hide {
+  position: absolute; top: 1px; right: 1px; width: 16px; height: 16px;
+  line-height: 14px; padding: 0; font-size: 11px; border-radius: 3px;
+  border: 1px solid var(--line); background: var(--panel-2); cursor: pointer;
+}

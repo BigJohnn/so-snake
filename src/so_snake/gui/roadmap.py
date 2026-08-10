@@ -143,11 +143,17 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 module="so_snake.data.replay",
             ),
             _item(
-                "cameras", "Wrist + third-person capture", "todo",
-                "MuJoCo renders both cameras and the GUI previews them live, but frames "
-                "are not written into episodes yet -- that needs a video encoder and an "
-                "async capture thread that does not steal time from the 30 Hz loop.",
-                blockers=("video encoder", "USB camera bring-up"),
+                "cameras", "Wrist + third-person capture", "done",
+                "Real USB cameras are enumerated with names, assigned to roles by the "
+                "operator, previewed live, and written into episodes as one mp4 per role. "
+                "Encoding runs on its own thread behind a bounded queue, and one video "
+                "frame is written per control step so video frame i is row i. The encoder "
+                "is chosen per machine -- hardware where CPU is scarce, software where "
+                "disk is -- verified by encoding before it is used, and both the choice "
+                "and its reason go into meta.json.",
+                module="so_snake.data.video",
+                evidence="322-step take, two 1080p cameras: 322 frames each, 0 dropped, "
+                         "0 stale; loop 26.6 Hz median while encoding vs 26.7 Hz idle",
             ),
             _item(
                 "lerobot-export", "LeRobotDataset export", "todo",

@@ -21,6 +21,9 @@ teleop = [
     "lerobot @ git+ssh://git@github.com/linkage-x/lerobot.git@box",
     "hidapi>=0.14",       # Switch Pro controller HID
     "feetech-servo-sdk",  # scservo_sdk: STS3215 bus for the real SOFollower arm
+    # The USB cameras come with lerobot too: capture goes through its
+    # `OpenCVCamera`, and `opencv-python-headless` is an unconditional lerobot
+    # dependency, so no camera package is listed here on purpose.
 ]
 # Hardware/data collection still depends on the lerobot checkout used in the lab.
 # Keep it out of the minimal install so the offline gates work on macOS and fresh machines.

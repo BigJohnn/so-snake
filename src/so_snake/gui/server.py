@@ -34,6 +34,7 @@ import numpy as np
 
 from ..config import REPO_ROOT, SoSnakeConfig
 from ..data import DEFAULT_EPISODE_ROOT, ReplayConfig
+from ..m0_perception import CAMERA_ROLES, CameraSpec, list_devices
 from ..rig import RigSpec, availability, mujoco_import_error
 from .preview import encode_png, ensure_headless_gl, placeholder_png
 from .roadmap import roadmap_payload
@@ -98,9 +99,24 @@ class Gateway:
             },
             "episode_root": str(self.session.store.root),
             "availability": availability(),
-            "cameras": ["third_person", "wrist"],
+            "cameras": list(CAMERA_ROLES),
             "gl_backend": os.environ.get("MUJOCO_GL", ""),
         }
+
+    def cameras_payload(self) -> dict[str, Any]:
+        """Enumerate the cameras attached to this machine.
+
+        Deliberately not part of `/api/config`, which the UI polls: listing
+        means opening each device and pulling a frame, which takes seconds and
+        competes with a session that already has one of them open. The UI asks
+        for this on demand, and refuses to ask while the arm is busy.
+        """
+        if self.session.busy:
+            raise RuntimeError(
+                "cannot scan for cameras while a session is running -- "
+                "the scan would open devices the session is using"
+            )
+        return {"devices": list_devices(), "roles": list(CAMERA_ROLES)}
 
     def episodes_payload(self) -> dict[str, Any]:
         return {
@@ -152,6 +168,35 @@ class Gateway:
 # ------------------------------------------------------------------ decoding
 
 
+def cameras_from_body(body: dict[str, Any]) -> tuple[CameraSpec, ...]:
+    """Read the role -> device assignments out of a request body.
+
+    Shaped `{"cameras": {"wrist": 3, "third_person": "/dev/video0"}}`. A role
+    mapped to an empty string or null means "not this session" and is dropped
+    rather than rejected, so the UI can clear a picker without having to send a
+    different shape. `RigSpec.validate` rejects unknown roles.
+    """
+    raw = body.get("cameras") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("cameras must be an object of role -> device")
+
+    specs: list[CameraSpec] = []
+    for role, device in raw.items():
+        if device is None or (isinstance(device, str) and not device.strip()):
+            continue
+        # An index arrives as a JSON number, a path as a string; a numeric
+        # string is an index typed into a text field, which is the common case
+        # on macOS where devices have no paths.
+        if isinstance(device, str) and device.strip().lstrip("-").isdigit():
+            device = int(device.strip())
+        elif isinstance(device, bool):  # bool is an int subclass; not a device
+            raise ValueError(f"camera {role!r} has an invalid device")
+        elif not isinstance(device, (int, str)):
+            raise ValueError(f"camera {role!r} has an invalid device")
+        specs.append(CameraSpec(role=str(role), index_or_path=device))
+    return tuple(specs)
+
+
 def spec_from_body(body: dict[str, Any], *, default_backend: str = "mock") -> RigSpec:
     """Build a `RigSpec` from a request body, taking nothing on trust.
 
@@ -160,6 +205,7 @@ def spec_from_body(body: dict[str, Any], *, default_backend: str = "mock") -> Ri
     that posted 500 must not become the arm's per-step budget.
     """
     spec = RigSpec(
+        cameras=cameras_from_body(body),
         backend=str(body.get("backend", default_backend)),
         source=str(body.get("source", "scripted")),
         port=str(body.get("port", "")),
@@ -272,6 +318,8 @@ class GuiHandler(BaseHTTPRequestHandler):
         elif path == "/api/episode":
             episode_id = _str_param(query, "id")
             self._guard(lambda: self.gateway.episode_detail(episode_id))
+        elif path == "/api/cameras":
+            self._guard(self.gateway.cameras_payload)
         elif path == "/api/preview.png":
             self._serve_preview(query)
         elif path.startswith("/api/"):

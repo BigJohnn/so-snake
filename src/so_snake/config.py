@@ -272,8 +272,49 @@ class TeleopConfig:
 
 
 @dataclass(frozen=True)
+class VideoConfig:
+    """How camera frames are encoded into an episode.
+
+    There is no globally right encoder, so the default decides per machine.
+    Measured here on two 1080p streams at 30 Hz: `hevc_videotoolbox` needs 0.30
+    of a core and 1.67 Mbps; `libsvtav1` needs 1.44 cores and 0.52 Mbps, at the
+    same measured picture (43.0 vs 42.8 dB). Hardware is 4.8x cheaper in CPU,
+    software 3.2x cheaper on disk, so the answer is whichever the recording
+    machine is short of. `so_snake.data.video.select_encoder` applies the rule
+    and writes both the choice and its reason into the episode.
+    """
+
+    # "auto" probes this machine. Anything else names an encoder, which is
+    # probed too -- an operator who asks for one that cannot run here wants to
+    # be told, not quietly given a different one.
+    codec: str = "auto"
+
+    # Below this many CPUs, "auto" prefers hardware. The software encoder needs
+    # ~1.4 cores for two 1080p streams; against a control loop that needs 0.03,
+    # that is affordable on eight cores and not on four.
+    hw_core_threshold: int = 8
+
+    # Software quality. CRF 30 measured 42.8 dB at 0.52 Mbps on camera footage.
+    crf: int = 30
+    # SVT-AV1 speed preset; 12 is the fastest and the only one that keeps up
+    # with two cameras (141 fps against the 60 needed; libx264 manages 53).
+    preset: int = 12
+
+    # Hardware quality on VideoToolbox's 0-100 scale, used when `hw_bitrate` is
+    # zero. Bitrate turned out to be the more predictable knob of the two.
+    hw_quality: int = 50
+    hw_bitrate: int = 1_500_000
+
+    # Frames in flight per camera before frames start being dropped. Two
+    # seconds at 30 Hz: long enough to ride out a keyframe, short enough that a
+    # wedged encoder shows up while the take is still running.
+    queue_size: int = 60
+
+
+@dataclass(frozen=True)
 class SoSnakeConfig:
     arm: ArmConfig = field(default_factory=ArmConfig)
     limits: TaskLimits = field(default_factory=TaskLimits)
     teleop: TeleopConfig = field(default_factory=TeleopConfig)
     ik: IK5DConfig = field(default_factory=IK5DConfig)
+    video: VideoConfig = field(default_factory=VideoConfig)

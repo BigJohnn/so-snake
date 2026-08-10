@@ -14,6 +14,20 @@
 ## 起服务
 
 ```bash
+scripts/run_gui.sh                       # 一键:依赖 → 构建 → 起服务 → 开浏览器
+scripts/run_gui.sh --port 9000           # 认识的参数之外,原样转给 serve_gui.py
+scripts/run_gui.sh --skip-build          # 确定 dist 是新的,别等 npm
+scripts/run_gui.sh --no-open             # 不动浏览器
+```
+
+`npm install` 只在 `node_modules` 缺失、或 `package-lock.json` 比
+`node_modules/.package-lock.json` 新时跑;`npm run build` 只在 `dist/index.html`
+缺失、或前端源文件比它新时跑。所以重复执行的代价就是起一个进程 —— 拿它当日常入口
+即可,不用自己判断该不该重新构建。
+
+分步版本(CI、或者想自己控制每一步):
+
+```bash
 cd tools/gui/frontend && npm install && npm run build   # 只需一次(改前端后重跑)
 PYTHONPATH=src .venv/bin/python scripts/serve_gui.py              # http://localhost:8770
 ```
@@ -31,6 +45,109 @@ cd tools/gui/frontend && npm run dev             # http://localhost:5173
 
 注意用哪个解释器。`python` 在这台机器上是 miniconda base(mujoco 3.2.5、PyOpenGL
 3.1.0),不是仓库的 `.venv`。仓库其它命令一律用 `.venv/bin/python`,这里也一样。
+
+## 真实相机
+
+遥操作页左侧「相机」一栏点**扫描相机**,把扫出来的设备指派给「第三人称」和「腕部」,
+再启动会话。预览窗口优先显示真相机,没有指派才回落到 MuJoCo 的仿真相机。
+
+几件必须知道的事:
+
+**扫描是个按钮,不是自动的。** 列举要逐个打开设备并真取一帧才算数 —— `isOpened()`
+不够,macOS 上锁屏的 iPhone 会以 Continuity Camera 的身份开得好好的然后一帧都不给。
+所以它慢(每个设备一秒上下),而且在 macOS 上第一次会弹系统摄像头权限。这两件事都不
+该发生在页面加载里。会话运行中扫描会被拒(409):扫描要打开的正是会话占着的设备。
+
+**没扫到任何相机,先查权限。** 被拒绝的进程看到的是「没有设备」,不是报错。
+系统设置 → 隐私与安全性 → 摄像头。
+
+**按画面认相机,不要按编号。** 扫描结果给的是每个设备**当前看到的缩略图**,没有名字。
+这不是偷懒 —— macOS 上 OpenCV 的 index 空间和 `system_profiler` 的顺序不一致,和
+ffmpeg 的 AVFoundation 列表也不一致,同一批相机三种枚举给出三种顺序:
+
+```
+OpenCV index         0=DECXIN(工作区)  1=DECXIN  2=FaceTime  3=OBS 虚拟相机
+system_profiler      0=OBS  1=FaceTime  2=DECXIN  3=DECXIN
+ffmpeg avfoundation  0=OBS  1=FaceTime  2=DECXIN  3=DECXIN
+```
+
+早期版本把 `system_profiler` 的顺序按位置套到 OpenCV index 上,于是**把内置
+FaceTime 相机报成了 DECXIN**,而且下游没有任何东西能发现 —— 两者都是 1080p、都正常
+出帧,录出来的 episode 要等人打开看才知道拍错了。所以名字整个去掉了,靠看。
+
+这也是区分两个同型号相机的唯一办法:这台机器上两个 DECXIN 型号字符串完全相同,能
+区分它们的只有各自拍到的画面。换 USB 口或重启后编号会变,重扫一次。
+
+### 怎么确定哪个是哪个
+
+**Linux(实验室 / Orin):有稳定 id,直接用。** 扫描会优先给出
+`/dev/v4l/by-id/usb-..._-video-index0` 这样的符号链接,udev 用厂商、型号、序列号**和
+物理 USB 口路径**拼出来,所以两个同型号相机拿到不同的链接,而且重启、别的设备增减都
+不影响。OpenCV 接受路径和接受编号一样,`CameraSpec.index_or_path` 两者都存,所以这样
+配好的 rig 拔插之后依然有效。菜单上带 🔒 的就是这种。换到别的 USB 口链接会变 —— 那是
+诚实的行为,因为你确实改了物理接线。
+
+**macOS:没有可靠的程序化办法,别找了。** uniqueID 是存在的(`0x1300001bcf2cd1`,编的
+是 USB 位置),但 OpenCV 不接受按 uniqueID 打开,试过返回 False。而任何枚举都不共享
+OpenCV 的 index 空间 —— 这台机器上四种枚举给出四种顺序:
+
+```
+OpenCV 实际         0=DECXIN(工作区)  1=DECXIN  2=FaceTime  3=OBS
+system_profiler     0=OBS  1=FaceTime  2=DECXIN  3=DECXIN
+ffmpeg avfoundation 0=OBS  1=FaceTime  2=DECXIN  3=DECXIN
+AVFoundation(PyObjC) 0=FaceTime 1=OBS  2=DECXIN  3=DECXIN
+```
+
+能凑出一个今天对得上的置换,但那是拟合一次观测,下个 OpenCV 版本或下台机器就不成立
+——而且猜错是静默的。所以:
+
+1. **看缩略图**(默认做法)
+2. **拔插法**,要确认时最可靠:扫描 → 拔掉一个相机 → 重扫,消失的那个就是它。零代码,
+   100% 准确
+3. **减少变量**:退出 OBS(它的虚拟相机占一个编号)、关掉 iPhone 连续互通。设备少了,
+   编号就不容易在两次会话之间变
+
+**不向相机请求分辨率。** lerobot 的 `_configure_capture_settings` 会在设备没有采纳
+请求的宽高时抛错,而这两个同型号相机里有一个根本不接受 640x480,始终吐 1920x1080。
+所以一律按设备原生分辨率采,预览侧再等比缩放加黑边(不拉伸 —— 画面构图是操作者用来
+判断相机对没对准的依据,压扁了会误导)。
+
+**读帧不会拖慢控制回路。** 采集在 lerobot 自己的线程上,`read_latest` 只是看一眼它
+已经放下的那一帧,实测 0.0014 ms/次。两个 1080p 相机开着时回路 p05 25.9 Hz,不开时
+23.8 Hz —— 差异在噪声内。超过 500 ms 的帧当作没有,宁可空着也不显示一张不知道已经
+冻住了的图。
+
+## 视频编码
+
+录制时每个视角写一个 `<role>.mp4` 到 episode 目录里。编码在自己的线程上,前面挡一个
+有界队列 —— 编 1080p 一帧是毫秒级,而回路整个预算只有 33 ms,所以控制线程只负责把帧
+丢进队列。队列有界是因为无界的那个版本会把「编码器跟不上」变成「录制途中吃光内存」:
+1080p RGB 一帧 6 MB,积压一分钟就是 11 GB。
+
+**每个控制步写一帧**,即使相机没有新画面。这样 video 帧 *i* 就是 `frames.npz` 的第
+*i* 行。相机没新帧就重写上一帧(`stale`),队列满了才真丢(`dropped`),两个计数都进
+`meta.json`。跳过一帧会让之后每一帧都错位,而这种错位在训练之前完全看不出来。
+
+编码器**按机器探测选**,没有全局默认。规则和实测依据见 `so_snake/config.py` 的
+`VideoConfig`;`codec="auto"` 时,核数少于 `hw_core_threshold`(默认 8)用硬编码,
+否则用软编码。要点名就设 `VideoConfig.codec`,点名的也会先验证 —— 指定一个跑不了的
+编码器应该报错,而不是被悄悄换掉。
+
+探测是**真编几帧**而不是构造编码器对象。`av.codec.Codec(name, "w")` 只说明它被编译
+进来了:很多 FFmpeg 构建里有 NVENC 而机器上没有 NVIDIA 驱动,构造成功、编码失败,
+失败点落在一条 take 的第一帧上。同 `probe_gl_backend` 的道理,只是弱一档 —— GL 选错
+会让 `import mujoco` 直接抛异常所以必须开子进程,编码器抛的是能接住的异常,留在本
+进程里就够。
+
+**`q:v` 是个陷阱。** 它不是编码器选项,是 ffmpeg 命令行的简写,由 ffmpeg.c 翻译成
+`AV_CODEC_FLAG_QSCALE` + `global_quality = N × FF_QP2LAMBDA`,VideoToolbox 读的是那个
+**标志**。从 PyAV 的 options 字典塞 `"q:v"` 匹配不上任何 AVOption,被静默丢弃 ——
+质量 40 和 25 会产出字节完全相同的文件,都停在编码器默认的 ~9 Mbps 上。
+(lerobot 的 `datasets/video_utils.py` 目前就有这个 bug。)`data/video.py` 显式设了
+标志和 `global_quality`,这才是硬编码可用的前提。
+
+HEVC 还要显式打 `hvc1` tag:VideoToolbox 默认打 `hev1`,QuickTime / 预览 / Safari 对
+它支持很差。torchcodec 不在乎,但你双击一个 episode 想看一眼的时候在乎。
 
 ## GL 后端 / 相机预览
 
