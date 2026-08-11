@@ -182,6 +182,10 @@ def main() -> int:
 
     print()
     print("=" * 60)
+    if report.approach_note:
+        # The replay ran, but not from exactly the first frame. Said out loud:
+        # otherwise the first frames quietly close a gap nobody was told about.
+        print(f"  approach  {report.approach_note}")
     print(f"replay {'completed' if report.completed else 'stopped'}: {report.n_steps} steps")
     if report.aborted_reason:
         print(f"  reason  {report.aborted_reason}")

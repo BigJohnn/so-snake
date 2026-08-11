@@ -43,7 +43,7 @@ from ..data import (
     inspect_episode,
 )
 from ..m0_perception import CameraRig, frame_for_preview
-from ..m4_execution.motion import move_to_joints
+from ..m4_execution.motion import MoveOutcome, move_to_joints
 from ..rig import RigSpec, build_backend, build_cameras, build_source
 from ..start_pose import (
     DEFAULT_START_POSE_PATH,
@@ -634,6 +634,7 @@ class SessionManager:
                 "step": 0,
                 "total": int(episode.meta.n_steps),
                 "approach_remaining_deg": 0.0,
+                "approach_residual_deg": 0.0,
                 "completed": False,
                 "aborted_reason": "",
                 "issues": [{"level": i.level, "message": i.message} for i in issues],
@@ -651,6 +652,7 @@ class SessionManager:
 
     def _run_replay(self) -> None:
         replayer: EpisodeReplayer = self._replayer
+        physical = bool(self._spec is not None and self._spec.is_physical)
         try:
             report = replayer.run(
                 on_step=self._on_replay_step,
@@ -663,16 +665,33 @@ class SessionManager:
                         "phase": "done",
                         "completed": report.completed,
                         "aborted_reason": report.aborted_reason,
+                        "approach_residual_deg": round(report.approach_residual_deg, 2),
                         "summary": {k: float(v) for k, v in report.summary().items()},
                     }
                 )
+            if report.approach_note:
+                # The replay ran; this says it started from slightly off, and
+                # from where. Without it the operator sees a clean replay whose
+                # first frames were quietly closing a gap.
+                self.log("warn", f"replay approach: {report.approach_note}")
             level = "info" if report.completed else "warn"
             self.log(level, f"replay finished: {report.n_steps} steps"
                             + (f" — {report.aborted_reason}" if report.aborted_reason else ""))
+        except Exception:
+            self._teardown("replay failed")
+            raise
         finally:
             with self._lock:
                 self._replay["active"] = False
-            self._teardown("replay stopped")
+
+        if physical and not self._stop.is_set():
+            # The trajectory running out is not somebody asking for the arm to be
+            # released, and releasing it here drops it wherever the last frame
+            # left it -- which is the same fall that made homing useless before
+            # it started holding. The arm keeps torque; stop takes it off.
+            self._hold("replay finished — holding position, torque on")
+            return
+        self._teardown("replay stopped")
 
     def _on_replay_step(self, step: ReplayStep) -> None:
         with self._lock:
@@ -785,14 +804,29 @@ class SessionManager:
             self.log("warn", "start pose is outside the teleoperation workspace box")
         return self.status()
 
-    def _move_home(self, backend: LockedBackend) -> bool:
+    def _move_home(self, backend: LockedBackend) -> MoveOutcome:
         return move_to_joints(
             backend,
             self._home_target(),
             step_deg=self.config.teleop.max_joint_step_deg,
+            # From config, where the servo's measured standing offset lives: ask
+            # for better than the servo can hold and every homing move reports
+            # failure, which is exactly what used to happen.
+            tol_deg=self.config.teleop.joint_settle_tol_deg,
             hz=self.config.teleop.control_hz,
             on_progress=lambda remaining: self._on_replay_progress("homing", remaining),
             should_continue=lambda: not self._stop.is_set(),
+        )
+
+    def _log_home_outcome(self, outcome: MoveOutcome, suffix: str = "") -> None:
+        """Say where the arm actually ended up, not just whether it counted."""
+        if outcome.reached:
+            self.log("info", f"at home pose{suffix}")
+            return
+        why = "stopped moving" if outcome.stalled else "ran out of steps"
+        self.log(
+            "warn",
+            f"homing {why} {outcome.max_residual_deg:.1f} deg short: {outcome.describe()}{suffix}",
         )
 
     def _run_homing(self) -> None:
@@ -812,8 +846,7 @@ class SessionManager:
             # Stop means stop: release it rather than holding it mid-move.
             self._teardown("homing interrupted")
             return
-        self.log("info" if reached else "warn",
-                 "at home pose" if reached else "homing did not converge")
+        self._log_home_outcome(reached)
         self._hold("holding at home — torque on")
 
     def _hold(self, reason: str) -> None:
@@ -843,9 +876,7 @@ class SessionManager:
         try:
             reached = self._move_home(backend)
             if not self._stop.is_set():
-                self.log("info" if reached else "warn",
-                         "at home pose; waiting for the next take"
-                         if reached else "homing did not converge; waiting for the next take")
+                self._log_home_outcome(reached, suffix="; waiting for the next take")
         finally:
             loop.sync_target_to_arm()
             with self._lock:
@@ -1021,8 +1052,8 @@ def _idle_cameras() -> dict[str, Any]:
 
 def _idle_replay() -> dict[str, Any]:
     return {"active": False, "phase": "idle", "episode_id": "", "mode": "", "speed": 1.0,
-            "step": 0, "total": 0, "approach_remaining_deg": 0.0, "completed": False,
-            "aborted_reason": "", "issues": [], "summary": {}}
+            "step": 0, "total": 0, "approach_remaining_deg": 0.0, "approach_residual_deg": 0.0,
+            "completed": False, "aborted_reason": "", "issues": [], "summary": {}}
 
 
 def _spec_json(spec: RigSpec | None) -> dict[str, Any] | None:

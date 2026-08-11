@@ -100,14 +100,17 @@ def main() -> int:
     parser.add_argument("--max-relative-target", type=float, default=8.0, help="hardware per-step clamp, deg (>= --step-deg)")
     parser.add_argument("--step-deg", type=float, default=6.0,
                         help="goal lead per step toward the target, deg; also the servo drive (too small stalls under gravity)")
-    parser.add_argument("--tol-deg", type=float, default=1.0, help="stop when every joint is within this, deg")
+    parser.add_argument("--tol-deg", type=float, default=None,
+                        help="stop when every joint is within this, deg "
+                             "(default: TeleopConfig.joint_settle_tol_deg, the servo's "
+                             "measured standing offset)")
     parser.add_argument("--no-hold", action="store_true", help="release torque immediately instead of holding for ENTER")
     parser.add_argument("--yes", action="store_true", help="skip the safety confirmation prompt")
     args = parser.parse_args()
 
     for name, val in (("--step-deg", args.step_deg), ("--tol-deg", args.tol_deg),
                       ("--max-relative-target", args.max_relative_target)):
-        if val <= 0:
+        if val is not None and val <= 0:
             raise SystemExit(f"{name} must be positive")
     if args.max_relative_target < args.step_deg:
         print(f"note: --max-relative-target ({args.max_relative_target:g}) < --step-deg ({args.step_deg:g}); "
@@ -121,6 +124,7 @@ def main() -> int:
 
     config = SoSnakeConfig()
     hz = config.teleop.control_hz
+    tol_deg = args.tol_deg if args.tol_deg is not None else config.teleop.joint_settle_tol_deg
     try:
         port = detect_arm_port(args.port)
     except DeviceDetectionError as exc:
@@ -168,13 +172,15 @@ def main() -> int:
                 print(f"    moving... max remaining {remaining:6.1f} deg", flush=True)
                 next_print[0] = time.monotonic() + 0.5
 
-        reached = move_to_joints(
-            backend, start, step_deg=args.step_deg, tol_deg=args.tol_deg, hz=hz, on_progress=progress
+        outcome = move_to_joints(
+            backend, start, step_deg=args.step_deg, tol_deg=tol_deg, hz=hz, on_progress=progress
         )
-        if reached:
-            print("reached start pose.")
+        if outcome.reached:
+            print(f"reached start pose (within {tol_deg:g} deg).")
         else:
-            print("WARN: did not fully converge (obstruction, joint limit, or clamp too small).", file=sys.stderr)
+            print(f"WARN: ended {outcome.max_residual_deg:.1f} deg short: {outcome.describe()}"
+                  + ("; the arm had stopped moving -- obstruction, joint limit, or a clamp "
+                     "smaller than --step-deg." if outcome.stalled else "."), file=sys.stderr)
             rc = 1
 
         backend.write_joints_deg(start)  # final hold command

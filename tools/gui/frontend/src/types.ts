@@ -104,6 +104,9 @@ export interface ReplayStatus {
   step: number;
   total: number;
   approach_remaining_deg: number;
+  /** How far off the first frame the approach ended. A servo settles a degree
+   *  or two out; only a large value means something was holding the arm. */
+  approach_residual_deg: number;
   completed: boolean;
   aborted_reason: string;
   issues: ReplayIssue[];

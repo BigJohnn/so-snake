@@ -39,6 +39,11 @@ export function ReplayPage({
 
   const sessionMode = snapshot?.mode ?? "idle";
   const idle = sessionMode === "idle";
+  // Homed and energized. A replay may start from it -- and after a real replay
+  // this is where the session lands, so the arm holds the last frame instead of
+  // dropping out of it.
+  const held = sessionMode === "held";
+  const ready = idle || held;
   const replaying = sessionMode === "replay";
   const status = snapshot?.replay;
   const blocked = rigReady(rig, config);
@@ -93,18 +98,31 @@ export function ReplayPage({
               max={2}
               step={0.05}
               value={speed}
-              disabled={!idle}
+              disabled={!ready}
               onChange={(event) => setSpeed(Number(event.target.value))}
             />
           </Field>
 
-          <RigControls rig={rig} onChange={setRig} config={config} disabled={!idle} showSource={false} />
-          {blocked && idle ? <Banner tone="warn">{blocked}</Banner> : null}
+          <RigControls
+            rig={rig}
+            onChange={setRig}
+            config={config}
+            disabled={!idle}
+            clampDisabled={!ready}
+            showSource={false}
+          />
+          {blocked && ready ? <Banner tone="warn">{blocked}</Banner> : null}
+          {held ? (
+            <Banner tone="info">
+              机械臂已归位并<strong>保持力矩</strong>,可以直接回放;回放结束后仍然保持力矩,
+              要松开就点「停止 / 卸力」。
+            </Banner>
+          ) : null}
 
           <div className="row">
             <button
               className="btn primary"
-              disabled={!idle || !episodeId || Boolean(blocked)}
+              disabled={!ready || !episodeId || Boolean(blocked)}
               onClick={() => {
                 if (rig.backend === "real" && !window.confirm(
                   "真机回放:机械臂会先走到该条的第一帧,然后跑完整条轨迹。\n\n工作区清空了吗?手在急停旁吗?"
@@ -117,7 +135,7 @@ export function ReplayPage({
               开始回放
             </button>
             <button className="btn danger" disabled={idle} onClick={() => void run(api.stop)}>
-              停止
+              {held ? "停止 / 卸力" : "停止"}
             </button>
           </div>
           <div className="dim small" style={{ marginTop: 8 }}>
@@ -164,6 +182,15 @@ export function ReplayPage({
                   </Banner>
                 ))}
                 {status.aborted_reason ? <Banner tone="warn">{status.aborted_reason}</Banner> : null}
+                {!status.active && status.approach_residual_deg > 0 ? (
+                  // Where the approach actually ended. A servo holds a degree or
+                  // two off its command; that is normal and the first frames
+                  // close it, but it should not be invisible.
+                  <div className="hint dim small">
+                    起点距第一帧 {status.approach_residual_deg.toFixed(1)}°
+                    {status.completed ? "(回放照常进行,前几帧会补上)" : ""}
+                  </div>
+                ) : null}
                 {!status.active && Object.keys(status.summary).length > 0 ? (
                   <>
                     <div className="plot-title">

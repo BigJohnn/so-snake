@@ -187,6 +187,41 @@ AVFoundation(PyObjC) 0=FaceTime 1=OBS  2=DECXIN  3=DECXIN
 - **手动按「保存这条」停的不会再问一遍** —— 那本来就是一次判断。定长跑完只是帧数用完了,
   不是。
 
+## 回放:到不了第一帧,不等于回放不了
+
+真机回放的第一步是**限速、无 IK 地走到该条的第一帧**(`move_to_joints`),走到了才开始
+放。这里踩过一个坑,值得写下来:
+
+判「走到了」的容差原本是 **1.0°**,而这条臂根本做不到。STS3215 在位置模式下是个比例
+控制器,lerobot 的 `configure()` 还把增益减半(`P_Coefficient` 32 → 16,注释写的是
+"to avoid shakiness"),于是每个受力的关节都会**稳态偏一点**。从当晚录的 take 里直接
+量(`observation.state.joints_deg` 减 `action.joint.commanded_deg`,取臂静止在起始位姿
+那几十帧):
+
+```
+shoulder_pan  2.7    shoulder_lift  1.2    elbow_flex  0.8
+wrist_flex    1.1    wrist_roll     0.9        (度,均值)
+```
+
+肩部差 2.7°,比容差大一倍多,所以 `move_to_joints` **永远**报不成功;而回放当时把这个
+当致命错误直接 return,`SessionManager` 随即 teardown → `disconnect()` → 卸力。现象就是
+**臂走到起始位姿、卸力、一帧没放**。用当晚那条 441 帧的 take 在同样偏置的伺服模型上复现:
+旧设置放了 0/441,新设置 441/441。
+
+改法不是把容差调大了事,而是把两件事分开:
+
+- `TeleopConfig.joint_settle_tol_deg`(3.0°)= **伺服能站住的精度**,是量出来的,不是偏好;
+  归位、move_to_start、回放接近全都从这里取值。
+- `TeleopConfig.joint_stuck_deg`(8.0°)= **有东西挡着**。只有超过这个才中止回放,并且报的是
+  「哪几个关节、差多少、是不是已经不动了」,不再是一句「did not reach the first frame」。
+- 中间地带照常回放,并在日志和界面上说明「起点差 X°,前几帧会补上」—— 回放本身是限速的,
+  这点残差它自己就吃掉了。
+- `move_to_joints` 现在还会**检测停滞**(1 秒内最好成绩没改善 0.15°),不再对着一个够不到的
+  目标推满 200 步(7 秒)再放弃。
+
+**真机回放结束后也保持力矩**(状态 `held`),理由和归位一样:轨迹放完不是操作者要求卸力,
+而在最后一帧的位置上撒手,臂会直接掉下去。仿真 backend 不受影响,跑完照常回到 idle。
+
 ## 视频编码
 
 录制时每个视角写一个 `<role>.mp4` 到 episode 目录里。编码在自己的线程上,前面挡一个

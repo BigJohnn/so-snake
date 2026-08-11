@@ -59,8 +59,18 @@ def _move_to_start(backend: SOFollowerBackend, start_path: Path, config: SoSnake
 
     # step_deg leads the servo enough to drive against gravity; keep it within the
     # backend's max_relative_target so the hardware clamp does not starve it.
-    reached = move_to_joints(backend, start, step_deg=6.0, tol_deg=1.0, hz=config.teleop.control_hz, on_progress=progress)
-    print("at start pose." if reached else "WARN: move-to-start did not fully converge.")
+    # tol from config: it is the servo's measured standing offset, not a
+    # preference, and asking for better than it can hold means every move-to-start
+    # reports failure (see TeleopConfig.joint_settle_tol_deg).
+    outcome = move_to_joints(
+        backend, start, step_deg=6.0, tol_deg=config.teleop.joint_settle_tol_deg,
+        hz=config.teleop.control_hz, on_progress=progress,
+    )
+    if outcome.reached:
+        print("at start pose.")
+    else:
+        print(f"WARN: move-to-start ended {outcome.max_residual_deg:.1f} deg short "
+              f"({outcome.describe()})" + ("; it had stopped moving." if outcome.stalled else "."))
 
 
 def _startup_settle(backend: SOFollowerBackend, config: SoSnakeConfig, *, settle_steps: int, max_out_of_range_deg: float) -> None:

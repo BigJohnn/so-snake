@@ -275,6 +275,74 @@ def test_an_unbounded_take_still_runs_until_the_operator_stops_it(manager, tmp_p
     assert EpisodeStore(tmp_path).list_meta()[0].n_steps > 25
 
 
+def a_recorded_episode(manager, steps: int = 40) -> str:
+    """Record one short episode through the manager, and return to idle."""
+    manager.start_session(MOCK)
+    assert wait_until(lambda: manager.mode == "teleop")
+    manager.start_recording(task="for replay")
+    assert wait_until(lambda: manager.status()["recording"]["steps"] > steps)
+    manager.stop_recording(keep=True)
+    manager.stop()
+    return manager.store.list_meta()[0].id
+
+
+@pytest.fixture
+def fake_real(monkeypatch):
+    """Let `backend="real"` build a mock, so the physical path can be tested.
+
+    The physical branches -- adopting a held backend, holding torque when a
+    replay ends -- key off `RigSpec.is_physical`, which keys off the backend
+    name. Without this they could only ever be exercised with an arm on the
+    bench, which is to say never in CI and rarely anywhere else.
+    """
+    import so_snake.gui.session as session_module
+
+    monkeypatch.setattr(
+        session_module, "build_backend", lambda spec, config=None: MockFollower(arm=config.arm)
+    )
+    return RigSpec(backend="real", source="scripted", port="/dev/fake")
+
+
+def test_a_physical_replay_ends_holding_the_arm_rather_than_dropping_it(manager, fake_real):
+    """The trajectory running out is not a request to release the arm.
+
+    Releasing there drops it wherever the last frame left it -- the same fall
+    that made homing useless before it started holding. Only stop releases.
+    """
+    episode_id = a_recorded_episode(manager)
+
+    manager.start_replay(episode_id, fake_real, ReplayConfig(mode="joint", realtime=False))
+    assert wait_until(lambda: manager.mode == "held", timeout=20.0)
+
+    status = manager.status()
+    assert status["connected"] is True
+    assert status["replay"]["completed"] is True
+
+    manager.stop()
+    assert manager.mode == "idle"
+
+
+def test_a_replay_the_operator_stops_releases_the_arm(manager, fake_real):
+    """Stop means stop, on a physical arm too -- it is the one explicit release."""
+    episode_id = a_recorded_episode(manager, steps=100)
+
+    manager.start_replay(episode_id, fake_real, ReplayConfig(mode="joint", realtime=True))
+    assert wait_until(lambda: manager.status()["replay"]["step"] > 2, timeout=20.0)
+
+    manager.stop()
+    assert manager.mode == "idle"
+    assert manager.status()["spec"] is None
+
+
+def test_a_simulated_replay_still_ends_idle(manager):
+    """Nothing falls in simulation, so a finished replay hands the session back."""
+    episode_id = a_recorded_episode(manager)
+
+    manager.start_replay(episode_id, MOCK, ReplayConfig(mode="joint", realtime=False))
+    assert wait_until(lambda: manager.mode == "idle", timeout=20.0)
+    assert manager.status()["replay"]["completed"] is True
+
+
 # ------------------------------------------------------- the recorded start pose
 
 

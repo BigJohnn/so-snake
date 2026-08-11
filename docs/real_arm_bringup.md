@@ -35,6 +35,27 @@ be mapped to a device name on macOS (see `so_snake.m0_perception`), so
 is attached — with two it refuses, because a wrist-labelled third-person view is
 not detected by anything downstream.
 
+## The servo settles a couple of degrees out, and that is normal
+
+Measured from the recorded takes (`observation.state.joints_deg` minus
+`action.joint.commanded_deg`, over frames where the arm was standing still at
+the start pose):
+
+    shoulder_pan  2.7    shoulder_lift  1.2    elbow_flex  0.8
+    wrist_flex    1.1    wrist_roll     0.9        (degrees, mean)
+
+The STS3215 in position mode is a proportional controller and lerobot's
+`configure()` halves its gain (`P_Coefficient` 32 -> 16, "to avoid shakiness"),
+so every loaded joint holds with a standing offset. Nothing is wrong with the
+arm; it simply cannot be commanded to a degree.
+
+This is why `TeleopConfig.joint_settle_tol_deg` is 3.0 and not 1.0. With 1.0,
+`move_to_joints` never reported success, and `EpisodeReplayer` treated that as
+fatal -- so a real-arm replay walked the arm to the episode's first pose,
+aborted, and released torque without playing a frame. "Arrived" and "stuck" are
+now separate questions: `joint_stuck_deg` (8.0) is the one that stops a move,
+and it reports which joints and by how much.
+
 ## Bring-up order
 
 0. `scan_devices.py` — what is attached (optional; the port is detected anyway).

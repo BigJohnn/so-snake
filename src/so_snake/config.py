@@ -266,6 +266,28 @@ class TeleopConfig:
     # with some wrist pitches the jaw or wrist body can sit below the tool frame.
     min_robot_mesh_z_m: float = 0.025
 
+    # How close a point-to-point move (`move_to_joints`) has to get before the
+    # arm counts as arrived, and how far off means it is stuck rather than
+    # merely imprecise.
+    #
+    # These are properties of the servo, not preferences. The STS3215 in
+    # position mode is a proportional controller, and lerobot's `configure()`
+    # halves its gain (`P_Coefficient` 32 -> 16, "to avoid shakiness"), so it
+    # settles with a standing offset wherever gravity or friction loads it.
+    # Measured on this bench, from `observation.state.joints_deg` minus
+    # `action.joint.commanded_deg` while the arm sat still at the start pose:
+    #
+    #     shoulder_pan  2.7    shoulder_lift  1.2    elbow_flex  0.8
+    #     wrist_flex    1.1    wrist_roll     0.9        (degrees, mean)
+    #
+    # The old 1.0 deg tolerance was therefore unreachable on a good day, and
+    # `move_to_joints` reported every homing and every replay approach as
+    # "did not converge" -- which the replayer treated as fatal. 3.0 clears the
+    # measured offsets; `joint_stuck_deg` is the separate question of whether
+    # something is physically holding the arm, and only that should stop a move.
+    joint_settle_tol_deg: float = 3.0
+    joint_stuck_deg: float = 8.0
+
     gripper_open_deg: float = 90.0
     gripper_closed_deg: float = 2.0
     gripper_step_deg: float = 6.0

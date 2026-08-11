@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
@@ -206,6 +207,72 @@ def test_replay_approaches_the_first_frame_before_playing(tmp_path, config):
     first = np.asarray(episode.commanded_joints_deg[0], float)
     assert np.abs(backend.true_joints_deg()[:5] - report.steps[0].commanded_joints_deg).max() < 10.0
     assert np.abs(report.steps[0].commanded_joints_deg - first).max() < 1e-6
+
+
+@dataclass
+class OffsetFollower(MockFollower):
+    """A servo that settles a fixed distance from whatever it is commanded.
+
+    This is the real arm, not a contrivance: lerobot halves the STS3215's P
+    gain, so it holds with a standing offset -- measured at up to 2.7 deg on
+    shoulder_pan on this bench, straight out of the recorded takes.
+    """
+
+    offset_deg: float = 2.7
+
+    def read_joints_deg(self) -> np.ndarray:
+        reading = super().read_joints_deg()
+        reading[0] += self.offset_deg
+        return reading
+
+
+def _replay_from(tmp_path, config, backend, steps: int = 40):
+    meta = record(tmp_path, config, steps=steps)
+    episode = EpisodeStore(tmp_path).load(meta.id)
+    return EpisodeReplayer(episode, backend, config, ReplayConfig(mode="joint", realtime=False)).run()
+
+
+AWAY = np.array([20.0, 90.0, -40.0, 20.0, 10.0, 40.0])
+
+
+def test_the_measured_standing_offset_counts_as_arrived(tmp_path, config):
+    """The bug this group of tests exists for.
+
+    A 1.0 deg approach tolerance against a servo that stands 2.7 deg off its
+    command meant `move_to_joints` never reported success; the replayer treated
+    that as fatal and the session tore down. On the arm that looked like: walk
+    to the first pose, drop torque, play nothing.
+    """
+    report = _replay_from(tmp_path, config, OffsetFollower(initial_joints_deg=AWAY))
+
+    assert report.approach_reached
+    assert report.completed and report.n_steps == 40
+
+
+def test_a_servo_that_settles_short_of_tolerance_still_plays(tmp_path, config):
+    """Between "arrived" and "stuck" the replay goes ahead, and says that it did.
+
+    Playback is rate-limited, so its own first frames close a residual of a few
+    degrees. Refusing to play over one is what cost the operator the take.
+    """
+    backend = OffsetFollower(initial_joints_deg=AWAY, offset_deg=5.0)
+    report = _replay_from(tmp_path, config, backend)
+
+    assert report.completed and report.n_steps == 40
+    # Reported rather than hidden: the operator is told it started slightly off.
+    assert not report.approach_reached
+    assert 3.0 < report.approach_residual_deg < 8.0
+    assert "shoulder_pan" in report.approach_note
+
+
+def test_an_arm_that_is_really_stuck_still_stops_the_replay(tmp_path, config):
+    """The other half: a big residual is an obstruction, not a servo's offset."""
+    backend = OffsetFollower(initial_joints_deg=AWAY, offset_deg=30.0)
+    report = _replay_from(tmp_path, config, backend)
+
+    assert not report.completed and report.n_steps == 0
+    assert "did not reach the first frame" in report.aborted_reason
+    assert "shoulder_pan" in report.aborted_reason
 
 
 def test_replay_stops_between_steps_when_asked(tmp_path, config):

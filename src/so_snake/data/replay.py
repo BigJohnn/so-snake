@@ -72,9 +72,17 @@ class ReplayConfig:
     max_joint_rate_deg_s: float | None = None
 
     # Approach to the first frame: how far the command leads the measurement per
-    # step, and how close counts as arrived.
+    # step, how close counts as arrived, and how far off means the arm is stuck.
+    #
+    # None takes both from `TeleopConfig` (`joint_settle_tol_deg` /
+    # `joint_stuck_deg`), which is where the servo's measured standing offset
+    # lives. They were 1.0 deg and "any miss is fatal" here, and on the real arm
+    # that combination aborted every replay before it played a frame: the
+    # shoulder settles ~2.7 deg out and cannot do better, so the approach never
+    # reported success and the replay gave up -- releasing torque as it went.
     approach_step_deg: float = 6.0
-    approach_tol_deg: float = 1.0
+    approach_tol_deg: float | None = None
+    approach_stuck_deg: float | None = None
 
     realtime: bool = True
     check_clearance: bool = True
@@ -89,6 +97,16 @@ class ReplayConfig:
         if self.max_joint_rate_deg_s is not None:
             return float(self.max_joint_rate_deg_s)
         return float(config.teleop.max_joint_step_deg * config.teleop.control_hz)
+
+    def approach_tolerance_deg(self, config: SoSnakeConfig) -> float:
+        if self.approach_tol_deg is not None:
+            return float(self.approach_tol_deg)
+        return float(config.teleop.joint_settle_tol_deg)
+
+    def approach_stuck_tolerance_deg(self, config: SoSnakeConfig) -> float:
+        if self.approach_stuck_deg is not None:
+            return float(self.approach_stuck_deg)
+        return float(config.teleop.joint_stuck_deg)
 
 
 @dataclass
@@ -136,6 +154,11 @@ class ReplayReport:
     completed: bool = False
     aborted_reason: str = ""
     approach_reached: bool = False
+    # How far off the first frame the approach ended, and which joints. Non-empty
+    # `approach_note` means the replay went ahead anyway -- worth showing, not
+    # worth stopping for.
+    approach_residual_deg: float = 0.0
+    approach_note: str = ""
     steps: list[ReplayStep] = field(default_factory=list)
 
     def summary(self) -> dict[str, float]:
@@ -324,22 +347,45 @@ class EpisodeReplayer:
             self.backend.connect()
 
         first = np.clip(np.concatenate([commanded[0], [gripper[0]]]), self._lo_full(), self._hi_full())
-        report.approach_reached = move_to_joints(
+        approach = move_to_joints(
             self.backend,
             first,
             step_deg=self.replay.approach_step_deg,
-            tol_deg=self.replay.approach_tol_deg,
+            tol_deg=self.replay.approach_tolerance_deg(self.config),
             hz=self.config.teleop.control_hz,
             on_progress=(lambda remaining: on_progress("approach", remaining)) if on_progress else None,
+            should_continue=should_continue,
             sleep=time.sleep if self.replay.realtime else (lambda _s: None),
         )
-        if not report.approach_reached:
-            # Not fatal: on the mock and in MuJoCo this only ever means the
-            # tolerance was optimistic. On the real arm it means the arm is
-            # stalled or obstructed, and the operator should be told before the
-            # trajectory starts running against whatever is holding it.
-            report.aborted_reason = "did not reach the first frame within tolerance"
+        report.approach_reached = bool(approach)
+        report.approach_residual_deg = approach.max_residual_deg
+
+        if approach.interrupted:
+            report.aborted_reason = "stopped by the operator during the approach"
             return report
+        if not approach.reached:
+            # Two different failures used to share one verdict, and the strict
+            # one was wrong: a servo that settles a couple of degrees out has
+            # *arrived* as far as anything can tell it to, and refusing to play
+            # the episode over that is how a real replay ended before it began.
+            # Only a residual big enough to be an obstruction, a joint limit or
+            # a stalled drive is worth stopping for -- and playback itself is
+            # rate-limited, so it absorbs a small residual in its first frames.
+            stuck_deg = self.replay.approach_stuck_tolerance_deg(self.config)
+            if approach.max_residual_deg > stuck_deg:
+                report.aborted_reason = (
+                    f"the arm did not reach the first frame: {approach.describe()} "
+                    f"(over the {stuck_deg:.0f} deg limit"
+                    + (", and it had stopped moving" if approach.stalled else "")
+                    + ") -- check for an obstruction, and that the joint map and the "
+                    "episode belong to this arm"
+                )
+                return report
+            report.approach_note = (
+                f"started {approach.max_residual_deg:.1f} deg off the first frame "
+                f"({approach.describe()}); within the {stuck_deg:.0f} deg limit, so the "
+                "replay went ahead and the first frames close the rest"
+            )
 
         recorded_hz = episode.meta.control_hz or self.config.teleop.control_hz
         period = 1.0 / (recorded_hz * self.replay.speed)
