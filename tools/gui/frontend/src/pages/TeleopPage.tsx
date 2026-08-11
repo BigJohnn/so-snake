@@ -4,7 +4,7 @@ import { useSeries, useTicker } from "../hooks";
 import { SeriesPlot } from "../components/SeriesPlot";
 import { Banner, Card, Empty, Field, JointBar, Pill, Stat } from "../components/ui";
 import { DEFAULT_RIG, RigControls, rigBody, rigReady, type RigState } from "../components/RigControls";
-import type { AppConfig, Snapshot, Telemetry } from "../types";
+import type { AppConfig, Snapshot, StartPoseStatus, Telemetry } from "../types";
 
 const AXES = ["x", "y", "z"] as const;
 
@@ -20,12 +20,25 @@ export function TeleopPage({
   const [rig, setRig] = useState<RigState>(DEFAULT_RIG);
   const [name, setName] = useState("");
   const [task, setTask] = useState("");
+  // 600 frames at 30 Hz is 20 s, which is a demonstration rather than a clip.
+  // Fixed by default because takes an operator ends by hand vary by seconds and
+  // that variance ends up in the dataset; 0 restores "until I say stop".
+  const [takeSteps, setTakeSteps] = useState(600);
+  const [takeCount, setTakeCount] = useState(10);
 
   const mode = snapshot?.mode ?? "idle";
   const idle = mode === "idle";
   const teleop = mode === "teleop";
+  // Homed and energized. Not idle -- the arm is standing there under torque --
+  // but a session may start straight from it, which is the point: torque is
+  // never dropped between homing and teleoperating.
+  const held = mode === "held";
+  const ready = idle || held;
   const recording = Boolean(snapshot?.recording.recording);
+  const takes = snapshot?.takes;
+  const lastTake = snapshot?.last_take;
   const blocked = rigReady(rig, config);
+  const hz = config.teleop.control_hz;
 
   const series = useSeries(mode !== "idle");
   // Every role that something can fill: a real camera opened for it, or the
@@ -36,7 +49,10 @@ export function TeleopPage({
   const panes = config.cameras.filter(
     (role) => liveCameras.includes(role) || simCameras.includes(role)
   );
-  const previewOn = teleop && panes.length > 0;
+  // Kept on through the automatic homing between takes: the cameras are still
+  // open, and watching the arm walk back is exactly when the operator wants to
+  // see them -- that is when they check the scene is reset for the next take.
+  const previewOn = (teleop || mode === "homing") && panes.length > 0;
   // 8 fps. The gateway throttles to 10 and serves the cache in between, so
   // asking faster would only spend CPU that the video encoder wants while a
   // take is recording.
@@ -50,28 +66,51 @@ export function TeleopPage({
       {/* -------------------------------------------------------- left column */}
       <div className="grid" style={{ alignContent: "start" }}>
         <Card title="会话">
-          <RigControls rig={rig} onChange={setRig} config={config} disabled={!idle} />
-          {blocked && idle ? <Banner tone="warn">{blocked}</Banner> : null}
+          {/* Locked while the arm is held as well as while it is running: the
+              held backend is a specific arm on a specific port, and changing
+              which one is being asked for would only earn a refusal. */}
+          <RigControls
+            rig={rig}
+            onChange={setRig}
+            config={config}
+            disabled={!idle}
+            clampDisabled={!ready}
+          />
+          {blocked && ready ? <Banner tone="warn">{blocked}</Banner> : null}
+          {held ? (
+            <Banner tone="info">
+              已归位并<strong>保持力矩</strong> —— 可直接启动遥操作(从 home 位姿开始),
+              或点「停止 / 卸力」让机械臂松开。
+            </Banner>
+          ) : null}
           <div className="row">
             <button
               className="btn primary"
-              disabled={!idle || Boolean(blocked)}
+              disabled={!ready || Boolean(blocked)}
               onClick={() => void run(() => api.startSession(rigBody(rig)))}
             >
               启动遥操作
             </button>
             <button
               className="btn"
-              disabled={!idle || Boolean(blocked)}
-              title="以限速、无 IK 的方式走到 home 位姿"
+              disabled={!ready || Boolean(blocked)}
+              title="以限速、无 IK 的方式走到 home 位姿,到位后保持力矩"
               onClick={() => void run(() => api.home(rigBody(rig)))}
             >
               归位
             </button>
             <button className="btn danger" disabled={idle} onClick={() => void run(api.stop)}>
-              停止
+              {held ? "停止 / 卸力" : "停止"}
             </button>
           </div>
+
+          <StartPoseField
+            startPose={snapshot?.start_pose}
+            // Needs a live arm to read: teleop (the useful case -- fly there and
+            // press it) or held. Idle has nothing to read.
+            canCapture={teleop || held}
+            onCapture={() => void run(api.captureStartPose)}
+          />
           {rig.source === "pro" && teleop ? (
             <Banner tone="info">按住 ZL 才会运动;松开则目标冻结,可以重新摆手。</Banner>
           ) : null}
@@ -94,6 +133,66 @@ export function TeleopPage({
               onChange={(event) => setTask(event.target.value)}
             />
           </Field>
+          <div className="grid cols-2">
+            <Field
+              label="每条帧数"
+              hint={takeSteps > 0 ? `≈ ${(takeSteps / hz).toFixed(1)} s,录满自动保存` : "0 = 手动停止"}
+            >
+              <input
+                type="number"
+                min={0}
+                max={100000}
+                step={30}
+                value={takeSteps}
+                disabled={recording}
+                onChange={(event) => setTakeSteps(Math.max(0, Number(event.target.value) || 0))}
+              />
+            </Field>
+            <Field label="目标条数" hint="只用于计数提示,不会自动开录">
+              <input
+                type="number"
+                min={0}
+                max={1000}
+                value={takeCount}
+                disabled={recording}
+                onChange={(event) => setTakeCount(Math.max(0, Number(event.target.value) || 0))}
+              />
+            </Field>
+          </div>
+          {lastTake?.pending ? (
+            // The verdict on a take that ended on its own. Shown while the arm
+            // walks home, which is exactly when the operator knows whether it
+            // went well -- and before the next take overwrites their memory of
+            // this one.
+            <div className="banner info" style={{ display: "grid", gap: 8 }}>
+              <div>
+                刚录完 <span className="mono">{lastTake.id}</span> · {lastTake.n_steps} 帧 ·{" "}
+                {lastTake.duration_s.toFixed(1)} s{lastTake.task ? ` · ${lastTake.task}` : ""}
+                <br />
+                这条要吗?(不选就默认保留)
+              </div>
+              <div className="row">
+                <button className="btn primary" onClick={() => void run(() => api.decideLastTake(true))}>
+                  保留
+                </button>
+                <button
+                  className="btn danger"
+                  title="从磁盘删掉这条 episode(含视频),并把它从本次计数里减掉"
+                  onClick={() => void run(() => api.decideLastTake(false))}
+                >
+                  丢弃
+                </button>
+              </div>
+            </div>
+          ) : null}
+          {takes && takes.done_count > 0 ? (
+            <div className="row" style={{ marginBottom: 8 }}>
+              <Pill tone={takes.target_count && takes.done_count >= takes.target_count ? "ok" : "accent"}>
+                本次会话已录 {takes.done_count}
+                {takes.target_count ? ` / ${takes.target_count}` : ""} 条
+              </Pill>
+            </div>
+          ) : null}
           <div className="row">
             {recording ? (
               <>
@@ -114,8 +213,15 @@ export function TeleopPage({
             ) : (
               <button
                 className="btn record"
+                // Disabled during the automatic homing between takes (mode is
+                // "homing" while the arm walks back), which is also the honest
+                // signal that the next take is not ready to start yet.
                 disabled={!teleop}
-                onClick={() => void run(() => api.startRecording({ name, task }))}
+                onClick={() =>
+                  void run(() =>
+                    api.startRecording({ name, task, steps: takeSteps, target_count: takeCount })
+                  )
+                }
               >
                 ● 开始录制
               </button>
@@ -123,12 +229,24 @@ export function TeleopPage({
           </div>
           {!teleop && !recording ? (
             <div className="hint dim small" style={{ marginTop: 8 }}>
-              先启动遥操作会话再录制。一次会话可以连续录多条。
+              {mode === "homing"
+                ? "正在自动归位 …… 到位后即可开始下一条。"
+                : "先启动遥操作会话再录制。一次会话可以连续录多条。"}
+            </div>
+          ) : null}
+          {teleop && !recording ? (
+            <div className="hint dim small" style={{ marginTop: 8 }}>
+              录满 {takeSteps || "—"} 帧自动保存并归位,然后等你再按「开始录制」。
             </div>
           ) : null}
           {recording ? (
             <div className="stats" style={{ marginTop: 12 }}>
-              <Stat label="已录帧数" value={snapshot?.recording.steps ?? 0} small />
+              <Stat
+                label="已录帧数"
+                value={snapshot?.recording.steps ?? 0}
+                unit={takeSteps ? `/ ${takeSteps}` : ""}
+                small
+              />
               <Stat label="时长" value={(snapshot?.recording.duration_s ?? 0).toFixed(1)} unit="s" small />
             </div>
           ) : null}
@@ -337,6 +455,65 @@ export function TeleopPage({
         </div>
       </div>
     </div>
+  );
+}
+
+/** The homing target, and the button that re-records it from the arm.
+ *
+ * Shown next to the 归位 button rather than on a settings page because it is
+ * the thing that button does: without seeing which pose is recorded, "归位" is
+ * a move to somewhere the operator has to remember.
+ */
+function StartPoseField({
+  startPose,
+  canCapture,
+  onCapture
+}: {
+  startPose?: StartPoseStatus;
+  canCapture: boolean;
+  onCapture: () => void;
+}) {
+  const recorded = startPose?.source === "file";
+  const joints = Object.entries(startPose?.joints_deg ?? {});
+
+  return (
+    <Field
+      label="归位点"
+      hint={
+        recorded
+          ? "遥操作途中飞到想要的位置,按下就把当前关节角记成归位点(写 assets/so100_start_pose.json)"
+          : "还没记录过,归位走配置里的 home_joints_deg"
+      }
+    >
+      <div className="row">
+        <button
+          className="btn"
+          disabled={!canCapture}
+          title={
+            canCapture
+              ? "读当前关节角并写入 start pose;不发运动指令"
+              : "需要一条在线的臂:先启动遥操作,或先归位"
+          }
+          onClick={onCapture}
+        >
+          记录当前位姿为归位点
+        </button>
+        <Pill tone={recorded ? "ok" : "neutral"}>{recorded ? "已记录" : "用配置默认值"}</Pill>
+      </div>
+
+      {startPose?.error ? <Banner tone="warn">{startPose.error}</Banner> : null}
+      {recorded && startPose?.in_workspace_box === false ? (
+        <Banner tone="info">
+          这个归位点在遥操作工作区盒子之外 —— 可以用,但遥操作会从这里限幅飞回盒内。
+        </Banner>
+      ) : null}
+      {joints.length > 0 ? (
+        <div className="hint dim small mono" style={{ marginTop: 6 }}>
+          {joints.map(([name, value]) => `${name} ${value.toFixed(1)}°`).join("  ")}
+          {startPose?.recorded_at ? ` · ${startPose.recorded_at.slice(0, 16).replace("T", " ")}` : ""}
+        </div>
+      ) : null}
+    </Field>
   );
 }
 

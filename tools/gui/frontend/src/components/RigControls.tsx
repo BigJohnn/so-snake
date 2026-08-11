@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, type RigBody } from "../api";
 import { Banner, Field, Segmented } from "./ui";
-import type { AppConfig, BackendKind, CameraDevice, CameraRole, SourceKind } from "../types";
+import type { AppConfig, BackendKind, CameraDevice, CameraRole, PortScan, SourceKind } from "../types";
 
 export interface RigState {
   backend: BackendKind;
@@ -41,12 +41,98 @@ export function rigBody(rig: RigState): RigBody {
 export function rigReady(rig: RigState, config: AppConfig): string {
   const backend = config.availability.backends[rig.backend];
   if (!backend?.available) return backend?.reason || `${rig.backend} 不可用`;
-  if (rig.backend === "real" && !rig.port.trim()) return "真机需要串口";
+  // Note there is no check that a real rig names a port: an empty one is not
+  // missing input, it means "detect it", and the gateway answers with the ports
+  // it found when it cannot. Blocking here would make the operator look up a
+  // device name the machine already knows.
+  //
   // One device cannot feed two roles: the second `connect` on the same index
   // fails, and the failure lands in the worker after the session has started.
   const picked = Object.values(rig.cameras).filter((d) => d !== "");
   if (new Set(picked).size !== picked.length) return "两个视角选了同一个相机";
   return "";
+}
+
+/** The arm's serial port: left empty it is detected server-side.
+ *
+ * Scanning here is not the camera scan's opt-in click -- enumerating ports
+ * opens nothing and takes no time -- so this runs on mount and gives the
+ * operator the list to pick from when detection cannot decide (two adapters
+ * attached). An empty field is the normal case, and the placeholder says what
+ * it will resolve to.
+ */
+function PortPicker({
+  rig,
+  onChange,
+  disabled
+}: {
+  rig: RigState;
+  onChange: (rig: RigState) => void;
+  disabled: boolean;
+}) {
+  const [scan, setScan] = useState<PortScan | null>(null);
+  const [error, setError] = useState("");
+
+  const refresh = async () => {
+    setError("");
+    try {
+      setScan(await api.ports());
+    } catch (exc) {
+      setError(exc instanceof ApiError ? exc.message : String(exc));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const likely = scan?.ports.filter((p) => p.likely) ?? [];
+
+  return (
+    <Field
+      label="串口"
+      hint="留空即自动检测(按 USB 芯片认板子)。Linux 一般是 /dev/ttyACM0, macOS 是 /dev/cu.usbmodem*"
+    >
+      <div className="row">
+        <input
+          value={rig.port}
+          disabled={disabled}
+          placeholder={scan?.detected ? `${scan.detected}(自动)` : "自动检测"}
+          onChange={(event) => onChange({ ...rig, port: event.target.value })}
+        />
+        <button className="btn small" disabled={disabled} onClick={() => void refresh()}>
+          重新扫描
+        </button>
+        {rig.port ? (
+          <button className="btn small" disabled={disabled} onClick={() => onChange({ ...rig, port: "" })}>
+            清除
+          </button>
+        ) : null}
+      </div>
+
+      {error ? <Banner tone="error">{error}</Banner> : null}
+      {scan && !scan.detected && !error ? (
+        <Banner tone="warn">自动检测没定下来:{scan.reason.split("\n")[0]}</Banner>
+      ) : null}
+
+      {likely.length > 0 ? (
+        <div className="row">
+          {likely.map((port) => (
+            <button
+              key={port.device}
+              className={`btn small${rig.port === port.device ? " picked" : ""}`}
+              disabled={disabled}
+              title={port.label}
+              onClick={() => onChange({ ...rig, port: port.device })}
+            >
+              {port.device}
+              {port.device === scan?.detected ? " ✓" : ""}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </Field>
+  );
 }
 
 const ROLE_LABELS: Record<CameraRole, string> = {
@@ -218,12 +304,19 @@ export function RigControls({
   onChange,
   config,
   disabled,
+  clampDisabled = disabled,
   showSource = true
 }: {
   rig: RigState;
   onChange: (rig: RigState) => void;
   config: AppConfig;
+  /** Which arm this is: locked as soon as one is energized, held included. */
   disabled: boolean;
+  /** The per-step clamp, separately: it can still be changed on a held arm,
+   *  because the gateway writes it to the live backend rather than rebuilding
+   *  one -- and rebuilding is what would drop the torque. Defaults to
+   *  `disabled`, so callers that do not care keep the old behaviour. */
+  clampDisabled?: boolean;
   showSource?: boolean;
 }) {
   const backends = config.availability.backends;
@@ -264,14 +357,7 @@ export function RigControls({
             真机模式会给舵机上力矩并驱动机械臂。先跑 <span className="mono">scripts/preflight_real_arm.py</span>,
             清空工作区,手放急停旁。
           </Banner>
-          <Field label="串口" hint="Linux 一般是 /dev/ttyACM0, macOS 是 /dev/cu.usbmodem*">
-            <input
-              value={rig.port}
-              disabled={disabled}
-              placeholder="/dev/ttyACM0"
-              onChange={(event) => onChange({ ...rig, port: event.target.value })}
-            />
-          </Field>
+          <PortPicker rig={rig} onChange={onChange} disabled={disabled} />
           <Field
             label={`硬件每步钳位 ${rig.maxRelativeTarget.toFixed(1)}°`}
             hint="lerobot 硬件层限幅,叠加在回路自身的 6°/步 之上。首次上机取小值。"
@@ -282,7 +368,7 @@ export function RigControls({
               max={15}
               step={0.5}
               value={rig.maxRelativeTarget}
-              disabled={disabled}
+              disabled={clampDisabled}
               onChange={(event) => onChange({ ...rig, maxRelativeTarget: Number(event.target.value) })}
             />
           </Field>

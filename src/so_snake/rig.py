@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ARM_JOINTS, GRIPPER_JOINT, REPO_ROOT, SoSnakeConfig
+from .devices import detect_arm_port
 from .m0_perception import CAMERA_ROLES, CameraRig, CameraSpec, cameras_import_error
 from .m4_execution.backends import MockFollower, RobotBackend
 from .teleop.sources import ScriptedSource, TeleopSource
@@ -47,6 +48,9 @@ class RigSpec:
     source: str = "scripted"
 
     # -- real arm only ------------------------------------------------------
+    # Empty (or "auto") means "find it": `build_backend` resolves it through
+    # `devices.detect_arm_port`, so nothing has to know the port's name on this
+    # particular machine. An explicit port is always used as given.
     port: str = ""
     robot_id: str = "so_snake"
     joint_map_path: Path = DEFAULT_JOINT_MAP
@@ -80,8 +84,10 @@ class RigSpec:
             raise ValueError(f"backend must be one of {BACKENDS}, got {self.backend!r}")
         if self.source not in SOURCES:
             raise ValueError(f"source must be one of {SOURCES}, got {self.source!r}")
-        if self.backend == "real" and not self.port:
-            raise ValueError("the real backend needs --port")
+        # No check that a real backend names a port: an unset port now means
+        # "detect it", and detection fails at `build_backend` with the list of
+        # ports it found -- which is more use than "the real backend needs
+        # --port" was, and is the only place that can honestly answer it.
         if self.max_relative_target_deg <= 0 or self.gripper_speed_mult <= 0:
             raise ValueError("max_relative_target_deg and gripper_speed_mult must be positive")
         roles = [camera.role for camera in self.cameras]
@@ -129,7 +135,10 @@ def build_backend(spec: RigSpec, config: SoSnakeConfig | None = None) -> RobotBa
     clamp: dict[str, float] = {j: spec.max_relative_target_deg for j in ARM_JOINTS}
     clamp[GRIPPER_JOINT] = spec.max_relative_target_deg * spec.gripper_speed_mult
     return SOFollowerBackend(
-        port=spec.port,
+        # Resolved here rather than at RigSpec construction so a spec can be
+        # built, stored and inspected on a machine with no arm attached; the
+        # port is only needed by the thing that is about to open it.
+        port=detect_arm_port(spec.port),
         arm=config.arm,
         robot_id=spec.robot_id,
         max_relative_target=clamp,

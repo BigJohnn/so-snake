@@ -31,10 +31,12 @@ Workflow (all read-only; the arm is never powered/moved by the tool):
 
     # 2. Capture signs: move each joint (torque OFF, by hand) to its two HARD
     #    STOPS -- no direction to judge -- and answer one visible comparison:
-    PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py signs --port <PORT>
+    PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py signs
 
     # 3. Confirm: hand-move the limp arm and watch the mapped URDF angles + FK TCP:
-    PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py check --port <PORT>
+    PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py check
+
+Steps 2 and 3 auto-detect the arm's serial port; `--port` overrides it.
 
 The map is written to assets/so100_joint_map.json. Wiring it into
 SOFollowerBackend is a separate, explicit step -- this tool only produces and
@@ -52,6 +54,7 @@ from pathlib import Path
 import numpy as np
 
 from so_snake.config import ARM_JOINTS, GRIPPER_JOINT, JOINT_LIMITS_DEG, REPO_ROOT
+from so_snake.devices import DeviceDetectionError, detect_arm_port
 
 MAP_PATH = REPO_ROOT / "assets" / "so100_joint_map.json"
 CAL_PATH = (
@@ -143,7 +146,7 @@ def cmd_draft(args) -> int:
         print(f"flipped sign for: {sorted(flips)}")
     print("\nSigns above are PROVISIONAL (+1). Capture the real signs by nudging each")
     print("joint (torque OFF), which needs the arm plugged in:")
-    print(f"  PYTHONPATH=src {sys.executable} {Path(__file__).name} signs --port <PORT>")
+    print(f"  PYTHONPATH=src {sys.executable} {Path(__file__).name} signs")
     return 0
 
 
@@ -368,16 +371,25 @@ def main() -> int:
     p_draft.set_defaults(func=cmd_draft)
 
     p_signs = sub.add_parser("signs", help="guided read-only sign capture; nudge each joint as prompted")
-    p_signs.add_argument("--port", required=True, help="arm serial port, e.g. /dev/cu.usbmodem58760434321")
+    p_signs.add_argument("--port", default="", help="arm serial port; auto-detected when omitted")
     p_signs.add_argument("--id", default="so_snake", help="lerobot robot id")
     p_signs.set_defaults(func=cmd_signs)
 
     p_check = sub.add_parser("check", help="passive read-only live table; hand-move to confirm the map")
-    p_check.add_argument("--port", required=True, help="arm serial port, e.g. /dev/cu.usbmodem58760434321")
+    p_check.add_argument("--port", default="", help="arm serial port; auto-detected when omitted")
     p_check.add_argument("--id", default="so_snake", help="lerobot robot id")
     p_check.set_defaults(func=cmd_check)
 
     args = parser.parse_args()
+    if hasattr(args, "port"):
+        # Every hardware subcommand takes the same port, so it is resolved once
+        # here rather than in each of them. `draft` has no --port and no bus.
+        try:
+            args.port = detect_arm_port(args.port)
+        except DeviceDetectionError as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 2
+        print(f"arm port: {args.port}\n")
     return args.func(args)
 
 

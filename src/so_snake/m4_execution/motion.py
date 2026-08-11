@@ -26,6 +26,7 @@ def move_to_joints(
     hz: float = 30.0,
     max_extra_steps: int = 200,
     on_progress: Callable[[float], None] | None = None,
+    should_continue: Callable[[], bool] | None = None,
     sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
     """Walk `backend` to `target_deg` (in the backend's joint frame). Returns reached.
@@ -39,6 +40,12 @@ def move_to_joints(
     `step_deg` or the hardware clamp will re-starve the drive. Iterations are
     bounded so an obstruction or joint limit ends the move (returning False)
     instead of looping forever.
+
+    `should_continue` is polled between steps, like the teleoperation loop's. A
+    move that cannot be interrupted is one the operator's stop button does not
+    reach: without this, "stop" during a homing move means waiting for the arm
+    to finish walking there first. Returning False ends the move where it is and
+    reports False -- the arm holds that position, it is not released.
     """
     if step_deg <= 0 or tol_deg <= 0 or hz <= 0:
         raise ValueError("step_deg, tol_deg and hz must be positive")
@@ -49,6 +56,8 @@ def move_to_joints(
 
     max_iters = int(np.abs(target - measured).max() / step_deg) + max_extra_steps
     for _ in range(max_iters):
+        if should_continue is not None and not should_continue():
+            return False
         measured = np.asarray(backend.read_joints_deg(), float)
         err = target - measured
         if np.all(np.abs(err) <= tol_deg):

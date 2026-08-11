@@ -17,8 +17,10 @@ Safety is deliberate and layered:
 
 Read `scripts/preflight_real_arm.py` output first, and keep a hand on the power.
 
+The serial port is auto-detected (`--port` overrides it, as does SO_SNAKE_ARM_PORT):
+
     PYTHONPATH=src .venv/bin/python scripts/teleop_real_arm.py \
-        --port /dev/cu.usbmodem58760434321 --max-relative-target 5 --steps 600
+        --max-relative-target 5 --steps 600
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from pathlib import Path
 import numpy as np
 
 from so_snake.config import ARM_JOINTS, GRIPPER_JOINT, JOINT_LIMITS_DEG, REPO_ROOT, SoSnakeConfig
+from so_snake.devices import DeviceDetectionError, detect_arm_port
 from so_snake.m4_execution import JointFrameMap, SOFollowerBackend, move_to_joints
 from so_snake.teleop import NintendoProSource, TeleopLoop
 
@@ -126,7 +129,9 @@ def _print_summary(loop: TeleopLoop, backend: SOFollowerBackend) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--port", required=True, help="arm serial port, e.g. /dev/cu.usbmodem58760434321")
+    parser.add_argument("--port", default="",
+                        help="arm serial port; auto-detected when omitted "
+                             "(e.g. /dev/cu.usbmodem58760434321)")
     parser.add_argument("--id", default="so_snake", help="lerobot robot id (calibration)")
     parser.add_argument("--map", default=str(DEFAULT_MAP), help="joint-frame map JSON from map_joint_frames.py")
     parser.add_argument("--device-id", type=int, default=None, help="optional NintendoTeleop device id")
@@ -173,10 +178,15 @@ def main() -> int:
     max_relative_target = {j: args.max_relative_target for j in ARM_JOINTS}
     max_relative_target[GRIPPER_JOINT] = args.max_relative_target * args.gripper_speed_mult
     try:
+        port = detect_arm_port(args.port)
+    except DeviceDetectionError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    try:
         joint_map = JointFrameMap.load(map_path)
         source = NintendoProSource(controller="pro", device_id=args.device_id)
         backend = SOFollowerBackend(
-            port=args.port,
+            port=port,
             arm=config.arm,
             robot_id=args.id,
             max_relative_target=max_relative_target,
@@ -191,7 +201,7 @@ def main() -> int:
     print("=" * 60)
     print("REAL ARM TELEOP — the arm WILL move and torque WILL engage.")
     print("=" * 60)
-    print(f"  port                 {args.port}")
+    print(f"  port                 {port}{'' if args.port else '  (auto-detected)'}")
     print(f"  joint map            {map_path}")
     print(f"  max_relative_target  arm {args.max_relative_target:g} / gripper "
           f"{args.max_relative_target * args.gripper_speed_mult:g} deg/step (hardware clamp)")

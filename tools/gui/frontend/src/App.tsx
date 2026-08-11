@@ -21,7 +21,8 @@ const MODE_LABEL: Record<Mode, string> = {
   idle: "空闲",
   teleop: "遥操作中",
   replay: "回放中",
-  homing: "归位中"
+  homing: "归位中",
+  held: "已归位 · 保持力矩"
 };
 
 export default function App() {

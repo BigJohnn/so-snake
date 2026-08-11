@@ -17,10 +17,30 @@ LFS test artifact is missing on the remote and otherwise fails the whole install
 not the bare `SOFollowerConfig`; the bare one lacks `id`, so lerobot's base
 `Robot.__init__` (which reads `config.id`) rejects it.
 
+## Finding the hardware
+
+Nothing takes a mandatory `--port` any more: `so_snake.devices` identifies the
+driver board by its USB bridge chip (`1a86:55d3`, a WCH CH343, on this bench),
+excludes the ports that are never an arm (macOS Bluetooth, debug console), and
+resolves a single candidate **without opening anything** — so detection cannot
+disturb a running session. Two USB serial adapters attached, and it falls back to
+a read-only servo ping and takes whichever answers; still ambiguous, and it
+refuses with the list rather than picking. `--port` and `SO_SNAKE_ARM_PORT`
+override it, in that order. `scan_devices.py` shows all of this.
+
+Cameras are the opposite case and stay manual on purpose: an OpenCV index cannot
+be mapped to a device name on macOS (see `so_snake.m0_perception`), so
+`scan_devices.py` writes a thumbnail per index and roles are assigned by eye.
+`--camera <role>=auto` exists but only resolves when exactly one unclaimed camera
+is attached — with two it refuses, because a wrist-labelled third-person view is
+not detected by anything downstream.
+
 ## Bring-up order
 
-1. `preflight_real_arm.py [--probe]` — deps, joint contract, port, controller,
-   calibration file; `--probe` pings the servos read-only (no torque, no motion).
+0. `scan_devices.py` — what is attached (optional; the port is detected anyway).
+1. `preflight_real_arm.py [--probe] [--scan-cameras]` — deps, joint contract,
+   port, controller, cameras, calibration file; `--probe` pings the servos
+   read-only (no torque, no motion).
 2. `lerobot-calibrate --robot.type=so100_follower --robot.port=<PORT> --robot.id=so_snake`
    — interactive, moves the arm; writes `~/.cache/huggingface/lerobot/.../so_snake.json`.
 3. `map_joint_frames.py draft / signs / check` — build + verify the lerobot↔URDF map.

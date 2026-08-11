@@ -2,7 +2,9 @@
 // they are snake_case on the wire; renaming them in a mapping layer would buy a
 // naming convention and cost the ability to grep one name across both halves.
 
-export type Mode = "idle" | "teleop" | "replay" | "homing";
+/** "held" is homed-and-energized: nothing is driving the arm, but torque is on
+ *  and it is standing at the home pose. Only a stop releases it. */
+export type Mode = "idle" | "teleop" | "replay" | "homing" | "held";
 export type BackendKind = "mock" | "mujoco" | "real";
 export type SourceKind = "scripted" | "pro";
 export type ReplayMode = "joint" | "task";
@@ -46,6 +48,48 @@ export interface RecordingStatus {
   aborted_reason: string;
 }
 
+/** The take that just finished.
+ *
+ * `pending` means it ended on its own (it ran out of frames) and is waiting for
+ * the operator to keep or discard it. The episode is already on disk either way
+ * -- discarding deletes it -- because a take held in memory until someone
+ * approved it is a take a crash would lose.
+ */
+export interface LastTake {
+  id: string;
+  name: string;
+  task: string;
+  n_steps: number;
+  duration_s: number;
+  pending: boolean;
+}
+
+/** Where homing goes.
+ *
+ * `source` is "file" when a start pose was recorded (assets/so100_start_pose.json)
+ * and "config" when homing falls back to `TeleopConfig.home_joints_deg` -- which
+ * also happens when a recorded pose is unusable, and then `error` says why.
+ */
+export interface StartPoseStatus {
+  source: "file" | "config";
+  path: string;
+  error: string;
+  joints_deg: Record<string, number>;
+  recorded_at?: string;
+  recorded_from?: string;
+  task_pose_xyz_m?: number[];
+  in_workspace_box?: boolean;
+}
+
+/** The take batch: one episode's length, how many the operator means to
+ *  collect, and how many are done in this session. */
+export interface TakeStatus {
+  steps_per_take: number;
+  target_count: number;
+  done_count: number;
+  control_hz: number;
+}
+
 export interface ReplayIssue {
   level: "error" | "warning";
   message: string;
@@ -64,6 +108,27 @@ export interface ReplayStatus {
   aborted_reason: string;
   issues: ReplayIssue[];
   summary: Record<string, number>;
+}
+
+/** One serial port, as reported by /api/ports.
+ *
+ * `likely` is the gateway's judgement that this could be the arm: a known USB
+ * bridge chip, or a device name shaped like a USB serial adapter. The macOS
+ * Bluetooth and debug-console ports are never likely.
+ */
+export interface SerialPort {
+  device: string;
+  label: string;
+  usb_id: string;
+  known_as: string;
+  likely: boolean;
+}
+
+/** `detected` is "" when the gateway could not tell, and `reason` says why. */
+export interface PortScan {
+  ports: SerialPort[];
+  detected: string;
+  reason: string;
 }
 
 export type CameraRole = "third_person" | "wrist";
@@ -122,6 +187,9 @@ export interface Snapshot {
   latest: Telemetry | Record<string, never>;
   cameras: CameraStatus;
   recording: RecordingStatus;
+  start_pose: StartPoseStatus;
+  last_take: LastTake;
+  takes: TakeStatus;
   replay: ReplayStatus;
   events: EventItem[];
 }

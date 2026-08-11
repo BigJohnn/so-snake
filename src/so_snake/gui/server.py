@@ -34,6 +34,7 @@ import numpy as np
 
 from ..config import REPO_ROOT, SoSnakeConfig
 from ..data import DEFAULT_EPISODE_ROOT, ReplayConfig
+from ..devices import DeviceDetectionError, detect_arm_port, list_serial_ports
 from ..m0_perception import CAMERA_ROLES, CameraSpec, list_devices
 from ..rig import RigSpec, availability, mujoco_import_error
 from .preview import encode_png, ensure_headless_gl, placeholder_png
@@ -103,6 +104,35 @@ class Gateway:
             "gl_backend": os.environ.get("MUJOCO_GL", ""),
         }
 
+    def ports_payload(self) -> dict[str, Any]:
+        """Every serial port, and which one looks like the arm.
+
+        Safe to call while a session is running, unlike the camera scan: this
+        reads the OS's device list and opens nothing. `probe=False` keeps it
+        that way even when several adapters are attached -- the answer is then
+        "cannot tell", which the UI shows as a list to pick from.
+        """
+        ports = list_serial_ports()
+        detected, reason = "", ""
+        try:
+            detected = detect_arm_port(probe=False)
+        except DeviceDetectionError as exc:
+            reason = str(exc)
+        return {
+            "ports": [
+                {
+                    "device": p.device,
+                    "label": p.label(),
+                    "usb_id": p.usb_id,
+                    "known_as": p.known_as,
+                    "likely": p.score > 0,
+                }
+                for p in ports
+            ],
+            "detected": detected,
+            "reason": reason,
+        }
+
     def cameras_payload(self) -> dict[str, Any]:
         """Enumerate the cameras attached to this machine.
 
@@ -111,7 +141,10 @@ class Gateway:
         competes with a session that already has one of them open. The UI asks
         for this on demand, and refuses to ask while the arm is busy.
         """
-        if self.session.busy:
+        # `held` is busy but idle-handed: the arm is energized and nothing is
+        # driving it, and homing never opened a camera. Refusing there would
+        # mean releasing the arm just to look at the camera list.
+        if self.session.busy and not self.session.is_held:
             raise RuntimeError(
                 "cannot scan for cameras while a session is running -- "
                 "the scan would open devices the session is using"
@@ -204,11 +237,24 @@ def spec_from_body(body: dict[str, Any], *, default_backend: str = "mock") -> Ri
     because `max_relative_target_deg` is a hardware safety limit and a UI bug
     that posted 500 must not become the arm's per-step budget.
     """
+    backend = str(body.get("backend", default_backend))
+    port = str(body.get("port", "")).strip()
+    if backend == "real":
+        # A named port passes through untouched; "" and "auto" are detected.
+        # Resolved here rather than left to `build_backend` so the session, and
+        # the episode metadata it writes, records the port that was actually
+        # driven -- and so a machine with two adapters attached fails now, with
+        # the list of ports, instead of inside the worker thread.
+        try:
+            port = detect_arm_port(port)
+        except DeviceDetectionError as exc:
+            raise ValueError(str(exc)) from exc
+
     spec = RigSpec(
         cameras=cameras_from_body(body),
-        backend=str(body.get("backend", default_backend)),
+        backend=backend,
         source=str(body.get("source", "scripted")),
-        port=str(body.get("port", "")),
+        port=port,
         robot_id=str(body.get("robot_id", "so_snake")),
         max_relative_target_deg=float(
             np.clip(float(body.get("max_relative_target_deg", 5.0)), 0.5, 20.0)
@@ -320,6 +366,8 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(lambda: self.gateway.episode_detail(episode_id))
         elif path == "/api/cameras":
             self._guard(self.gateway.cameras_payload)
+        elif path == "/api/ports":
+            self._guard(self.gateway.ports_payload)
         elif path == "/api/episode/video":
             self._serve_episode_video(_str_param(query, "id"), _str_param(query, "camera"))
         elif path == "/api/preview.png":
@@ -474,10 +522,22 @@ class GuiHandler(BaseHTTPRequestHandler):
                     name=str(body.get("name", "")),
                     task=str(body.get("task", "")),
                     notes=str(body.get("notes", "")),
+                    # Clamped, not trusted: a take longer than the plots' history
+                    # is fine, but a UI bug posting a million frames would fill
+                    # the disk before anyone noticed the number was wrong.
+                    steps=int(np.clip(int(body.get("steps", 0) or 0), 0, 100_000)),
+                    target_count=int(np.clip(int(body.get("target_count", 0) or 0), 0, 1000)),
                 )
             )
+        elif path == "/api/start-pose/capture":
+            self._guard(session.capture_start_pose)
         elif path == "/api/record/stop":
             self._guard(lambda: session.stop_recording(keep=bool(body.get("keep", True))))
+        elif path == "/api/record/decide":
+            # The verdict on a take that ended on its own. Separate from
+            # /record/stop because nothing is being stopped: the episode is
+            # already written, and this either lets it stand or deletes it.
+            self._guard(lambda: session.decide_last_take(keep=bool(body.get("keep", True))))
         elif path == "/api/replay/start":
             self._guard(
                 lambda: session.start_replay(

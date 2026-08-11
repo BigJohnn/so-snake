@@ -9,9 +9,12 @@ cannot move the arm. It only pings the motors and reads their current position.
     # safe, no hardware:
     PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py
 
-    # also ping the servo bus read-only (needs the arm powered + plugged in):
-    PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py \
-        --port /dev/cu.usbmodem58760434321 --probe
+    # also ping the servo bus read-only (needs the arm powered + plugged in).
+    # The port is auto-detected; --port only to override it:
+    PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --probe
+
+    # and open every camera to see which ones deliver a frame (slow):
+    PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --scan-cameras
 
 Exit code is 0 when nothing FAILed (WARNs are allowed), 1 otherwise.
 
@@ -29,13 +32,18 @@ import sys
 from dataclasses import dataclass, field
 
 from so_snake.config import ARM_JOINTS, GRIPPER_JOINT, SoSnakeConfig
+from so_snake.devices import (
+    ARM_PORT_ENV,
+    DeviceDetectionError,
+    arm_port_candidates,
+    detect_arm_port,
+    list_serial_ports,
+    scan_cameras,
+)
 
 PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 _MARK = {PASS: "✓", WARN: "!", FAIL: "✗", SKIP: "-"}
 
-# Serial-port name fragments that usually denote a USB serial adapter (the arm),
-# as opposed to a Bluetooth or debug console port.
-_LIKELY_PORT_HINTS = ("usbmodem", "usbserial", "ttyacm", "ttyusb", "ftdi", "ch340", "wch")
 NINTENDO_VENDOR_ID = 0x057E
 
 
@@ -144,32 +152,32 @@ def check_config() -> Check:
     return c.set(c.status if c.status == FAIL else PASS)
 
 
-def _list_ports() -> list[tuple[str, str]]:
-    try:
-        from serial.tools import list_ports
-    except Exception:  # noqa: BLE001
-        return []
-    return [(p.device, (p.description or "").strip()) for p in list_ports.comports()]
+def check_serial_port(port: str | None) -> tuple[Check, str]:
+    """Enumerate the ports, and resolve the one the arm is on.
 
-
-def check_serial_port(port: str | None) -> Check:
+    Returns the resolved port alongside the check so `--probe` uses exactly the
+    port this reported, rather than detecting a second time and possibly
+    disagreeing with what the operator just read.
+    """
     c = Check("serial port")
-    ports = _list_ports()
+    ports = list_serial_ports()
     if not ports:
-        return c.set(WARN, "no serial ports enumerated (pyserial missing or none present)")
-    for dev, desc in ports:
-        likely = any(h in dev.lower() for h in _LIKELY_PORT_HINTS)
-        c.lines.append(f"{'* ' if likely else '  '}{dev}    {desc}")
-    likely_ports = [dev for dev, _ in ports if any(h in dev.lower() for h in _LIKELY_PORT_HINTS)]
+        return c.set(WARN, "no serial ports enumerated (pyserial missing or none present)"), ""
+    candidates = {p.device for p in arm_port_candidates(ports)}
+    for p in ports:
+        c.lines.append(f"{'* ' if p.device in candidates else '  '}{p.device:<32} {p.label()}")
 
-    if port is None:
-        if likely_ports:
-            c.lines.append(f"likely arm port: {likely_ports[0]}  (pass --port to select)")
-        return c.set(WARN, "no --port given; skipping port validation")
-    if port not in [dev for dev, _ in ports]:
-        return c.set(FAIL, f"--port {port} is not among the enumerated ports above")
-    c.lines.append(f"--port {port} found")
-    return c.set(PASS)
+    try:
+        resolved = detect_arm_port(port)
+    except DeviceDetectionError as exc:
+        return c.set(FAIL, *str(exc).splitlines()[-3:]), ""
+
+    if port:
+        if resolved not in {p.device for p in ports}:
+            return c.set(FAIL, f"--port {resolved} is not among the enumerated ports above"), resolved
+        return c.set(PASS, f"--port {resolved} found"), resolved
+    c.lines.append(f"auto-detected arm port: {resolved}  (override with --port or {ARM_PORT_ENV})")
+    return c.set(PASS), resolved
 
 
 def check_controller() -> Check:
@@ -186,7 +194,32 @@ def check_controller() -> Check:
     return c.set(PASS)
 
 
-def check_calibration(robot_id: str) -> Check:
+def check_cameras(scan: bool) -> Check:
+    """List the cameras that actually deliver a frame. Only with --scan-cameras.
+
+    Opt-in because the scan opens every index on the machine (about a second
+    each) and on macOS the first open raises the OS permission prompt. Neither
+    belongs in a check that is otherwise instant and side-effect free.
+    """
+    c = Check("cameras")
+    if not scan:
+        return c.set(SKIP, "not scanned; add --scan-cameras (opens each device, ~1 s per index)")
+    devices = scan_cameras()
+    if not devices:
+        return c.set(
+            WARN,
+            "no camera delivered a frame.",
+            "On macOS check Settings -> Privacy & Security -> Camera for this terminal;",
+            "a denied process sees no devices rather than an error.",
+        )
+    for d in devices:
+        c.lines.append(f"{d.label()}{'  (stable path)' if d.stable else ''}")
+    c.lines.append("Assign roles by looking at the picture -- the GUI scan shows a thumbnail")
+    c.lines.append("of each, and an index is not a name (see so_snake.m0_perception).")
+    return c.set(PASS)
+
+
+def check_calibration(robot_id: str, port: str = "") -> Check:
     c = Check(f"motor calibration (id={robot_id})")
     try:
         from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
@@ -200,9 +233,12 @@ def check_calibration(robot_id: str) -> Check:
         return c.set(PASS, "calibration file present")
     c.lines.append("no calibration file -- the arm has not been calibrated under this id.")
     c.lines.append("Calibrate once (moves the arm through its range) before teleop, e.g.:")
+    # The detected port goes straight into the command: lerobot-calibrate is an
+    # external tool and takes the port, so this is the one place the operator
+    # would otherwise still have to look it up.
     c.lines.append(
         f"  lerobot-calibrate --robot.type=so100_follower "
-        f"--robot.port=<PORT> --robot.id={robot_id}"
+        f"--robot.port={port or '<PORT>'} --robot.id={robot_id}"
     )
     return c.set(WARN, "(WARN, not FAIL: calibration is an expected first-time step)")
 
@@ -253,35 +289,48 @@ def probe_servo_bus(port: str, robot_id: str) -> Check:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--port", default=None, help="arm serial port, e.g. /dev/cu.usbmodem58760434321")
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="arm serial port; auto-detected when omitted (e.g. /dev/cu.usbmodem58760434321)",
+    )
     parser.add_argument("--id", default="so_snake", help="lerobot robot id (calibration file name)")
     parser.add_argument(
         "--probe",
         action="store_true",
-        help="open the servo bus read-only and ping motors (needs --port; never moves the arm)",
+        help="open the servo bus read-only and ping motors (never moves the arm)",
+    )
+    parser.add_argument(
+        "--scan-cameras",
+        action="store_true",
+        help="open every camera index to see which ones deliver a frame (~1 s each)",
     )
     args = parser.parse_args()
 
+    port_check, port = check_serial_port(args.port)
     checks = [
         check_platform(),
         check_dependencies(),
         check_config(),
-        check_serial_port(args.port),
+        port_check,
         check_controller(),
-        check_calibration(args.id),
+        check_cameras(args.scan_cameras),
+        check_calibration(args.id, port),
     ]
 
     if args.probe:
-        if not args.port:
-            checks.append(Check("servo bus probe (read-only)").set(FAIL, "--probe requires --port"))
+        if not port:
+            checks.append(
+                Check("servo bus probe (read-only)").set(FAIL, "no arm port; see the serial port check")
+            )
         elif any(c.status == FAIL for c in checks[:2]):
             checks.append(Check("servo bus probe (read-only)").set(SKIP, "skipped: fix dependencies first"))
         else:
-            checks.append(probe_servo_bus(args.port, args.id))
+            checks.append(probe_servo_bus(port, args.id))
     else:
         checks.append(
             Check("servo bus probe (read-only)").set(
-                SKIP, "not run; add --probe --port <PORT> to ping the servos (read-only)"
+                SKIP, "not run; add --probe to ping the servos (read-only)"
             )
         )
 

@@ -180,6 +180,20 @@ class SOFollowerBackend:
     def joint_names(self) -> tuple[str, ...]:
         return (*self.arm.joint_names, GRIPPER_JOINT)
 
+    @property
+    def max_relative_target(self) -> float | dict[str, float] | None:
+        return self._config.max_relative_target
+
+    def set_max_relative_target(self, clamp: float | dict[str, float] | None) -> None:
+        """Change the per-step hardware clamp on a connected arm.
+
+        lerobot reads `config.max_relative_target` inside every `send_action`,
+        so this takes effect on the next command with no reconnect. That matters
+        because the alternative -- rebuilding the backend to change one number --
+        means a disconnect, and a disconnect drops torque and lets the arm sag.
+        """
+        self._config.max_relative_target = clamp
+
     def connect(self) -> None:
         self._robot.connect()
 

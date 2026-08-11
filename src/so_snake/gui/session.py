@@ -32,7 +32,7 @@ from typing import Any, Callable
 
 import numpy as np
 
-from ..config import SoSnakeConfig
+from ..config import ARM_JOINTS, GRIPPER_JOINT, SoSnakeConfig
 from ..data import (
     DEFAULT_EPISODE_ROOT,
     EpisodeRecorder,
@@ -45,10 +45,26 @@ from ..data import (
 from ..m0_perception import CameraRig, frame_for_preview
 from ..m4_execution.motion import move_to_joints
 from ..rig import RigSpec, build_backend, build_cameras, build_source
+from ..start_pose import (
+    DEFAULT_START_POSE_PATH,
+    StartPoseError,
+    describe_start_pose,
+    load_start_pose,
+    save_start_pose,
+)
 from ..teleop.loop import StepRecord, TeleopLoop
 from .preview import SimPreview
 
-MODES = ("idle", "teleop", "replay", "homing")
+MODES = ("idle", "teleop", "replay", "homing", "held")
+
+# "held" is homing's resting state, and the reason it exists is torque. Dropping
+# torque at the end of a homing move puts the arm on the floor of its own
+# workspace -- gravity takes the elbow the moment the servos stop holding -- so
+# the pose the operator just asked for is gone before they can teleoperate from
+# it. Homing therefore ends *connected and energized*, and the session keeps that
+# backend so the next `start_session` adopts it instead of opening a second
+# handle on the same serial port. Torque comes off exactly where the operator
+# says so: `stop()`.
 
 # How many control steps of history the plots get. 600 at 30 Hz is 20 seconds,
 # which is about as far back as an operator looks while judging a take.
@@ -142,10 +158,14 @@ class SessionManager:
         self,
         config: SoSnakeConfig | None = None,
         episode_root: Path = DEFAULT_EPISODE_ROOT,
+        start_pose_path: Path = DEFAULT_START_POSE_PATH,
     ) -> None:
         self.config = config or SoSnakeConfig()
         self.store = EpisodeStore(episode_root)
         self.store.ensure_root()
+        # Injectable so a test can record a start pose without rewriting the
+        # bench's own; there is one real path and everything ships pointing at it.
+        self.start_pose_path = Path(start_pose_path)
 
         self._lock = threading.RLock()
         self._backend_lock = threading.Lock()
@@ -172,6 +192,23 @@ class SessionManager:
         self._error = ""
         self._started_at = 0.0
 
+        # The take batch: how long one episode runs, how many the operator means
+        # to collect, how many are done. `_home_pending` is set when a take ends
+        # and consumed by the worker on its next control step -- the homing move
+        # has to happen on the thread that owns the arm, not on the HTTP thread
+        # that pressed the button.
+        self._take_steps = 0
+        self._take_target = 0
+        self._takes_done = 0
+        self._home_pending = False
+        # The take that just ended by itself, waiting for the operator to say
+        # whether it was any good. It is already on disk -- the recorder streams
+        # frames and video as they happen, which is what makes a crash keep the
+        # take -- so "discard" is a delete, not a decision not to write.
+        self._last_take: dict[str, Any] | None = None
+        # (mtime_ns, summary) of the recorded start pose; see `_start_pose_summary`.
+        self._start_pose_cache: tuple[int, dict[str, Any]] = (-1, {})
+
         self._latest: dict[str, Any] = {}
         self._series: deque[dict[str, Any]] = deque(maxlen=SERIES_CAPACITY)
         self._events: deque[Event] = deque(maxlen=EVENT_CAPACITY)
@@ -196,12 +233,43 @@ class SessionManager:
     def busy(self) -> bool:
         return self.mode != "idle"
 
+    @property
+    def is_held(self) -> bool:
+        """Homed, energized, nothing driving it. Busy, but nothing is moving."""
+        return self.mode == "held"
+
     def _require_idle(self, action: str) -> None:
+        if self.is_held:
+            # Distinct from the generic busy message because the fix is
+            # different: nothing is running, the arm is simply still energized,
+            # and the operator has to decide whether to release it.
+            raise RuntimeError(
+                f"cannot {action}: the arm is held at the home pose with torque on. "
+                "Start teleop from it, home it again, or press stop to release it."
+            )
         if self.busy:
             raise RuntimeError(f"cannot {action}: the arm is busy ({self._mode})")
 
+    def _start_pose_summary(self) -> dict[str, Any]:
+        """Where homing will go, re-read only when the file has actually changed.
+
+        A `stat` per poll rather than a parse per poll, and rather than a value
+        cached at session start: the operator can record a new start pose from
+        the UI, and someone can edit the JSON by hand, and both should show up.
+        """
+        try:
+            stamp = self.start_pose_path.stat().st_mtime_ns
+        except OSError:
+            stamp = 0
+        if self._start_pose_cache[0] != stamp:
+            self._start_pose_cache = (stamp, describe_start_pose(self.start_pose_path))
+        return self._start_pose_cache[1]
+
     def status(self) -> dict[str, Any]:
         """One snapshot of everything the UI polls. Cheap; safe to call at 10 Hz."""
+        # Read before the lock is taken: it touches the filesystem, and the
+        # control loop takes this same lock on every step.
+        start_pose = self._start_pose_summary()
         with self._lock:
             spec = self._spec
             return {
@@ -216,6 +284,14 @@ class SessionManager:
                 # for: the difference is the whole point of showing it.
                 "cameras": self._cameras.status() if self._cameras else _idle_cameras(),
                 "recording": self._recorder.status() if self._recorder else _idle_recording(),
+                "start_pose": start_pose,
+                "last_take": dict(self._last_take) if self._last_take else _idle_last_take(),
+                "takes": {
+                    "steps_per_take": self._take_steps,
+                    "target_count": self._take_target,
+                    "done_count": self._takes_done,
+                    "control_hz": self.config.teleop.control_hz,
+                },
                 "replay": dict(self._replay),
                 "events": [event.to_json() for event in list(self._events)[-40:]],
             }
@@ -225,15 +301,68 @@ class SessionManager:
             rows = list(self._series)
         return rows[-max(1, limit):]
 
+    # ----------------------------------------------------------------- backend
+
+    def _acquire_backend(self, spec: RigSpec, action: str) -> tuple[LockedBackend, bool]:
+        """The backend for `spec`: the held one if it is the same arm, else a new one.
+
+        Adoption is what makes "home, then teleoperate" work on hardware. The
+        held backend still owns the serial port, so building a second one fails
+        to open it; and even if it could, the first thing a fresh
+        `SOFollowerBackend` does not do is keep torque -- the old one would have
+        to be disconnected, which drops the arm. So the same object carries over,
+        still connected, and teleop starts from the pose the operator homed to.
+
+        Only the identity of the arm has to match. `max_relative_target_deg` is
+        applied to the live backend instead, because it is a number the operator
+        is entitled to change between homing and teleoperating and re-opening the
+        port to honour it would cost the very torque this exists to keep.
+        """
+        with self._lock:
+            held = self._spec if self.is_held else None
+            if held is not None and self._backend is not None:
+                same_arm = (
+                    held.backend == spec.backend
+                    and held.port == spec.port
+                    and held.robot_id == spec.robot_id
+                    and Path(held.joint_map_path) == Path(spec.joint_map_path)
+                )
+                if not same_arm:
+                    raise RuntimeError(
+                        f"cannot {action}: the arm is held at home as "
+                        f"{held.backend} on {held.port or 'no port'}, and this asks for "
+                        f"{spec.backend} on {spec.port or 'no port'}. Press stop to release it first."
+                    )
+                backend = self._backend
+                self._apply_clamp(backend, spec)
+                return backend, True
+
+            self._require_idle(action)
+            return LockedBackend(build_backend(spec, self.config), self._backend_lock), False
+
+    def _apply_clamp(self, backend: LockedBackend, spec: RigSpec) -> None:
+        """Push `spec`'s per-step clamp onto an already-connected backend."""
+        setter = getattr(backend.inner, "set_max_relative_target", None)
+        if setter is None:  # mock and MuJoCo have no hardware clamp to set
+            return
+        clamp: dict[str, float] = {j: spec.max_relative_target_deg for j in ARM_JOINTS}
+        clamp[GRIPPER_JOINT] = spec.max_relative_target_deg * spec.gripper_speed_mult
+        if clamp != backend.inner.max_relative_target:
+            setter(clamp)
+            self.log("info", f"per-step clamp now {spec.max_relative_target_deg:g} deg (arm)")
+
     # ------------------------------------------------------------ teleop session
 
     def start_session(self, spec: RigSpec) -> dict[str, Any]:
-        """Bring up a backend and a source, and start teleoperating."""
-        with self._lock:
-            self._require_idle("start a session")
-            spec.validate()
+        """Bring up a backend and a source, and start teleoperating.
 
-            backend = LockedBackend(build_backend(spec, self.config), self._backend_lock)
+        Started from `held`, this adopts the arm as it stands: torque was never
+        dropped, so teleop begins from the home pose rather than from wherever
+        gravity left the arm.
+        """
+        spec.validate()
+        backend, adopted = self._acquire_backend(spec, "start a session")
+        with self._lock:
             source = build_source(spec, self.config)
             cameras = build_cameras(spec)
             loop = TeleopLoop(source, backend, self.config, stats_capacity=SERIES_CAPACITY)
@@ -254,8 +383,14 @@ class SessionManager:
             self._mode = "teleop"
             self._stop.clear()
             self._started_at = time.perf_counter()
+            # A new session is a new batch of takes; the counts from the last one
+            # would otherwise read as progress that has already been made, and
+            # its last take is no longer something to pass judgement on.
+            self._takes_done, self._home_pending = 0, False
+            self._last_take = None
 
-        self.log("info", f"session start: {spec.backend} backend, {spec.source} source")
+        self.log("info", f"session start: {spec.backend} backend, {spec.source} source"
+                         + (" (adopting the held arm)" if adopted else ""))
         self._spawn(self._run_teleop, "so-snake-teleop")
         return self.status()
 
@@ -285,16 +420,40 @@ class SessionManager:
             self._latest = _telemetry(record)
             self._series.append(_series_row(record))
             recorder = self._recorder
+            take_steps = self._take_steps
         if recorder is not None:
             recorder.append(record)
+            # A fixed-length take ends itself. Checked after the append so the
+            # episode is exactly `take_steps` rows long, and here rather than in
+            # the loop because the loop does not know what a take is.
+            if take_steps > 0 and recorder.is_recording and recorder.n_steps >= take_steps:
+                # `review=True`: nobody decided this one was good -- the clock
+                # ended it. It is kept, and offered back for a verdict while the
+                # arm walks home, which is the moment the operator actually
+                # knows whether the grasp worked.
+                self.stop_recording(keep=True, review=True)
+
+        # Set by whichever ended the take -- the length above, or the operator's
+        # save/discard on an HTTP thread. Homing runs here because this is the
+        # thread that owns the arm, and it blocks the control loop for as long as
+        # the move takes, which is correct: nothing should be teleoperating the
+        # arm while it walks home.
+        if self._home_pending:
+            self._home_pending = False
+            self._home_between_takes()
 
     def stop(self) -> dict[str, Any]:
         """Ask the worker to finish its current step and shut down.
 
-        One stop for every mode -- teleop, replay, homing -- because there is
-        one worker. Blocking until the thread is gone matters: the caller's next
-        request may be "start a session on the real arm", and two backends
+        One stop for every mode -- teleop, replay, homing, held -- because there
+        is one worker. Blocking until the thread is gone matters: the caller's
+        next request may be "start a session on the real arm", and two backends
         holding the same serial port is a mess with no good recovery.
+
+        From `held` there is no worker to wait for: the arm is standing there
+        under torque, and stop is the thing that takes the torque off. That is
+        why this is the *only* way out of held -- releasing an arm is an action
+        someone asks for, never one that happens because a move finished.
         """
         self._stop.set()
         thread = self._thread
@@ -302,19 +461,68 @@ class SessionManager:
             thread.join(timeout=10.0)
             if thread.is_alive():
                 self.log("error", "worker thread did not stop within 10 s")
+        if self.is_held:
+            self._teardown("torque released")
         return self.status()
 
     # -------------------------------------------------------------- recording
 
-    def start_recording(self, *, name: str = "", task: str = "", notes: str = "") -> dict[str, Any]:
+    def start_recording(
+        self,
+        *,
+        name: str = "",
+        task: str = "",
+        notes: str = "",
+        steps: int = 0,
+        target_count: int = 0,
+    ) -> dict[str, Any]:
+        """Begin one take.
+
+        `steps` is its length in control frames -- 0 means "until the operator
+        says stop", which is what this did before takes had a length. A
+        length matters for a dataset: episodes an operator ends by hand vary by
+        seconds, and the model sees that variance as signal about the task.
+
+        `target_count` is how many takes the batch is meant to collect. It is a
+        target, not a gate: the arm still only records when the operator presses
+        the button, so this is the count they are working towards, shown back to
+        them, and it does not stop anything when it is reached.
+        """
         with self._lock:
+            if self._mode == "homing" and self._loop is not None:
+                # Between takes. Not an error the operator caused -- the arm is
+                # still walking back -- so it says what to wait for.
+                raise RuntimeError("the arm is returning home between takes; wait for it to arrive")
             if self._mode != "teleop" or self._recorder is None:
                 raise RuntimeError("start a teleop session before recording")
+            if self._recorder.is_recording:
+                raise RuntimeError("already recording")
+            if self._last_take is not None and self._last_take.get("pending"):
+                # Starting the next take is a verdict on the last one: the
+                # operator moved on, so it stands. Said out loud rather than
+                # silently, because the alternative reading is "I forgot".
+                self._last_take["pending"] = False
+                self.log("info", f"kept {self._last_take['id']} (starting the next take)")
+            self._take_steps = max(0, int(steps))
+            self._take_target = max(0, int(target_count))
             meta = self._recorder.start(name=name, task=task, notes=notes)
-        self.log("info", f"recording {meta.id}" + (f" — {task}" if task else ""))
+            length = self._take_steps
+        hz = self.config.teleop.control_hz
+        self.log(
+            "info",
+            f"recording {meta.id}"
+            + (f" — {task}" if task else "")
+            + (f" ({length} frames, ~{length / hz:.0f} s)" if length else " (until stopped)"),
+        )
         return self.status()
 
-    def stop_recording(self, *, keep: bool = True) -> dict[str, Any]:
+    def stop_recording(self, *, keep: bool = True, review: bool = False) -> dict[str, Any]:
+        """End the current take. `review` offers it back for a keep/discard verdict.
+
+        Set for takes that ended on their own: pressing "save" is a decision,
+        while running out of frames is not, and the operator has usually only
+        just seen how the take went by the time it stops.
+        """
         with self._lock:
             recorder = self._recorder
             if recorder is None or not recorder.is_recording:
@@ -322,10 +530,68 @@ class SessionManager:
             episode_id = recorder.episode_id
             steps = recorder.n_steps
         written = recorder.stop(keep=keep)
+        with self._lock:
+            if written is not None:
+                self._takes_done += 1
+                self._last_take = {
+                    "id": written.id,
+                    "name": written.name,
+                    "task": written.task,
+                    "n_steps": int(written.n_steps),
+                    "duration_s": float(written.duration_s),
+                    # Only an unreviewed take blocks on a verdict; one the
+                    # operator ended by hand has already had one.
+                    "pending": bool(review),
+                }
+            done, target = self._takes_done, self._take_target
+            # Home after every take, kept or discarded: the next one should start
+            # from the same pose as this one did, and the operator should not
+            # have to fly the arm back by hand between takes. Consumed by the
+            # worker on its next step; nothing happens if teleop is not running.
+            self._home_pending = self._mode == "teleop"
         if written is None:
             self.log("warn", f"discarded {episode_id} ({steps} steps)")
         else:
-            self.log("info", f"saved {written.id}: {written.n_steps} steps, {written.duration_s:.1f} s")
+            progress = f"  [{done}/{target}]" if target else f"  [{done}]"
+            self.log(
+                "info",
+                f"saved {written.id}: {written.n_steps} steps, {written.duration_s:.1f} s{progress}",
+            )
+            if target and done == target:
+                self.log("info", f"batch complete: {done} takes recorded")
+        return self.status()
+
+    def decide_last_take(self, *, keep: bool) -> dict[str, Any]:
+        """The operator's verdict on the take that just finished.
+
+        `keep` only dismisses the prompt -- the episode is already written, and
+        that is deliberate: a take held in memory until someone approved it
+        would be a take lost to a crash, an unplugged camera or a full disk,
+        which is the one failure this pipeline is built to avoid. Discarding is
+        therefore a delete, and it also takes the take back off the batch count,
+        so "8 / 10" means eight episodes that are actually worth training on.
+        """
+        with self._lock:
+            take = self._last_take
+            if take is None or not take.get("pending"):
+                raise RuntimeError("no take is waiting for a verdict")
+            episode_id = str(take["id"])
+            if keep:
+                take["pending"] = False
+                self.log("info", f"kept {episode_id}")
+                return self.status()
+
+        deleted = self.store.delete(episode_id)
+        with self._lock:
+            self._last_take = None
+            self._takes_done = max(0, self._takes_done - 1)
+            done, target = self._takes_done, self._take_target
+        progress = f"  [{done}/{target}]" if target else f"  [{done}]"
+        self.log(
+            "warn" if deleted else "error",
+            f"discarded {episode_id}{progress}" if deleted
+            else f"could not discard {episode_id}: nothing on disk under that id",
+        )
         return self.status()
 
     # ----------------------------------------------------------------- replay
@@ -337,12 +603,13 @@ class SessionManager:
         replay: ReplayConfig,
     ) -> dict[str, Any]:
         """Play an episode back. Refuses if the static inspection finds an error."""
+        spec.validate()
+        # Adopts a held arm for the same reason teleop does: the replayer walks
+        # to the episode's first pose itself, and it should start that walk from
+        # the home pose the operator homed to, not from a sagged one.
+        backend, _adopted = self._acquire_backend(spec, "start a replay")
         with self._lock:
-            self._require_idle("start a replay")
-            spec.validate()
             episode = self.store.load(episode_id)
-
-            backend = LockedBackend(build_backend(spec, self.config), self._backend_lock)
             issues = inspect_episode(
                 episode,
                 self.config,
@@ -433,11 +700,14 @@ class SessionManager:
     # ----------------------------------------------------------------- homing
 
     def start_homing(self, spec: RigSpec) -> dict[str, Any]:
-        """Walk the arm to the configured home pose, IK-free and rate-limited."""
+        """Walk the arm to the configured home pose, IK-free and rate-limited.
+
+        Ends in `held`, not `idle`: see the note on MODES. Homing an already-held
+        arm is allowed and adopts it, so "home again" costs no torque either.
+        """
+        spec.validate()
+        backend, _adopted = self._acquire_backend(spec, "home the arm")
         with self._lock:
-            self._require_idle("home the arm")
-            spec.validate()
-            backend = LockedBackend(build_backend(spec, self.config), self._backend_lock)
             self._spec, self._backend = spec, backend
             self._error = ""
             self._mode = "homing"
@@ -447,25 +717,140 @@ class SessionManager:
         self._spawn(self._run_homing, "so-snake-homing")
         return self.status()
 
+    def _home_target(self) -> np.ndarray:
+        """Where homing goes: the recorded start pose, else the configured home.
+
+        Read from disk each time rather than cached at session start, so a pose
+        recorded mid-session is the one the *next* homing move uses -- which is
+        the entire point of being able to record it while teleoperating.
+
+        Falls back rather than failing when the file is unusable: refusing to
+        home an energized arm because a JSON file is malformed would leave the
+        operator with no way to park it. The reason is logged and shown.
+        """
+        try:
+            recorded = load_start_pose(self.start_pose_path, arm=self.config.arm)
+        except StartPoseError as exc:
+            self.log("warn", f"{exc}; homing to the configured home pose instead")
+            recorded = None
+        if recorded is not None:
+            return recorded
+        gripper_lo, gripper_hi = self.config.arm.joint_limits_deg["gripper"]
+        return np.array([*self.config.teleop.home_joints_deg, (gripper_lo + gripper_hi) / 2.0])
+
+    def capture_start_pose(self) -> dict[str, Any]:
+        """Record where the arm is right now as the pose homing returns to.
+
+        Meant to be pressed mid-teleoperation: fly the arm to where every take
+        should begin, press this, and from then on the automatic homing between
+        takes brings it back *there* rather than to the configured default.
+
+        The joints are read from the arm rather than taken from the last
+        telemetry frame. It costs one bus read, serialised against the control
+        loop by `LockedBackend`, and it is worth it: telemetry carries the arm
+        joints and the *commanded* gripper, and a start pose that gets the
+        gripper from a different source than the rest of the arm is a pose that
+        homes to something nobody looked at.
+        """
+        with self._lock:
+            backend, loop, mode = self._backend, self._loop, self._mode
+        if backend is None or mode not in ("teleop", "held") or not backend.is_connected:
+            raise RuntimeError(
+                "no live arm to read: start a teleop session, or home the arm, before "
+                "recording a start pose"
+            )
+
+        measured = np.asarray(backend.read_joints_deg(), float)
+        task_pose = None
+        if loop is not None:
+            # The 5D readout is for the operator ("is this inside the box?"),
+            # never read back as a target -- homing stays joint-space.
+            n_arm = len(self.config.arm.joint_names)
+            task_pose = loop.ik.task_pose(measured[:n_arm]).pose.as_array()
+
+        document = save_start_pose(
+            measured,
+            path=self.start_pose_path,
+            arm=self.config.arm,
+            limits=self.config.limits,
+            task_pose=task_pose,
+            source=f"gui/{mode}",
+        )
+        joints = ", ".join(f"{k} {v:g}" for k, v in document["joints_urdf_deg"].items())
+        self.log("info", f"start pose recorded: {joints}")
+        if document.get("in_workspace_box") is False:
+            # Not an error -- a start pose outside the teleoperation box is a
+            # normal thing to want -- but the operator should know that teleop
+            # will clamp its way in from there.
+            self.log("warn", "start pose is outside the teleoperation workspace box")
+        return self.status()
+
+    def _move_home(self, backend: LockedBackend) -> bool:
+        return move_to_joints(
+            backend,
+            self._home_target(),
+            step_deg=self.config.teleop.max_joint_step_deg,
+            hz=self.config.teleop.control_hz,
+            on_progress=lambda remaining: self._on_replay_progress("homing", remaining),
+            should_continue=lambda: not self._stop.is_set(),
+        )
+
     def _run_homing(self) -> None:
         backend = self._backend
         try:
-            backend.connect()
-            gripper_lo, gripper_hi = self.config.arm.joint_limits_deg["gripper"]
-            target = np.array(
-                [*self.config.teleop.home_joints_deg, (gripper_lo + gripper_hi) / 2.0]
-            )
-            reached = move_to_joints(
-                backend,
-                target,
-                step_deg=self.config.teleop.max_joint_step_deg,
-                hz=self.config.teleop.control_hz,
-                on_progress=lambda remaining: self._on_replay_progress("homing", remaining),
-            )
-            self.log("info" if reached else "warn",
-                     "at home pose" if reached else "homing did not converge")
+            if not backend.is_connected:
+                backend.connect()
+            reached = self._move_home(backend)
+        except Exception:
+            # Torque state after a failed move is not something to reason about
+            # optimistically: release it and go back to idle, which is what
+            # `_spawn`'s handler does with the exception it is about to see.
+            self._teardown("homing failed")
+            raise
+        if self._stop.is_set():
+            # The operator asked for the arm to stop while it was on its way.
+            # Stop means stop: release it rather than holding it mid-move.
+            self._teardown("homing interrupted")
+            return
+        self.log("info" if reached else "warn",
+                 "at home pose" if reached else "homing did not converge")
+        self._hold("holding at home — torque on")
+
+    def _hold(self, reason: str) -> None:
+        """Park in `held`: connected, energized, nothing driving the arm."""
+        with self._lock:
+            self._mode = "held"
+            self._loop = None
+            self._replayer = None
+            self._started_at = time.perf_counter()
+        self.log("info", reason)
+
+    def _home_between_takes(self) -> None:
+        """Walk home mid-session, then hand the arm back to the running loop.
+
+        Called from the control loop's step callback, so the loop is stalled for
+        the duration and nothing else is commanding the arm. Afterwards the
+        loop's target is re-synced to where the arm now is -- without that it
+        would still be holding the target from the end of the take and would
+        drag the arm straight back out of the home pose on the next step.
+        """
+        backend, loop = self._backend, self._loop
+        if backend is None or loop is None or self._stop.is_set():
+            return
+        with self._lock:
+            self._mode = "homing"
+        self.log("info", "take finished; returning home")
+        try:
+            reached = self._move_home(backend)
+            if not self._stop.is_set():
+                self.log("info" if reached else "warn",
+                         "at home pose; waiting for the next take"
+                         if reached else "homing did not converge; waiting for the next take")
         finally:
-            self._teardown("homing finished")
+            loop.sync_target_to_arm()
+            with self._lock:
+                if self._mode == "homing":
+                    self._mode = "teleop"
 
     # ------------------------------------------------------------------ preview
 
@@ -578,6 +963,7 @@ class SessionManager:
             self._backend = None
             self._replayer = None
             self._started_at = 0.0
+            self._home_pending = False
 
         with self._preview_lock:
             # The GL context belongs to the model that is going away with the
@@ -623,6 +1009,10 @@ class SessionManager:
 def _idle_recording() -> dict[str, Any]:
     return {"recording": False, "id": None, "name": "", "task": "", "steps": 0,
             "duration_s": 0.0, "aborted_reason": ""}
+
+
+def _idle_last_take() -> dict[str, Any]:
+    return {"id": "", "name": "", "task": "", "n_steps": 0, "duration_s": 0.0, "pending": False}
 
 
 def _idle_cameras() -> dict[str, Any]:

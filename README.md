@@ -96,14 +96,33 @@ PYTHONPATH=src .venv/bin/python scripts/view_pro_controller_sim.py --source scri
 只读地打开舵机总线(ping + 读当前位置),**不上力矩、不发目标位、不会让臂动**:
 
 ```bash
-# 安全检查:依赖 / 关节契约 / 串口 / 手柄 / 标定文件是否存在
-PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --port <PORT>
+# 安全检查:依赖 / 关节契约 / 串口 / 手柄 / 相机 / 标定文件是否存在
+PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py
 # 追加只读总线探测(臂需上电插好;不会动臂)
-PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --port <PORT> --probe
+PYTHONPATH=src .venv/bin/python scripts/preflight_real_arm.py --probe
 ```
 
-真机需要 `.[teleop]` 附加层(含 `feetech-servo-sdk` 提供 `scservo_sdk`)。macOS 上
-串口通常是 `/dev/cu.usbmodem*`。首次使用必须先标定(会手动移动臂过全程),标定与
+真机需要 `.[teleop]` 附加层(含 `feetech-servo-sdk` 提供 `scservo_sdk`)。
+
+### 串口自动检测
+
+**串口不用自己填。**所有驱动真臂的脚本(preflight / teleop / move_to_start /
+map_joint_frames / record / replay)和 GUI 都会自己找:按 USB 厂商:产品号认驱动板的
+桥接芯片(本机是 WCH CH343 `1a86:55d3`),名字形状只作兜底;macOS 的
+`Bluetooth-Incoming-Port` 和 debug console 直接排除 —— 它们在每台 mac 上都在,打开
+蓝牙那个还会卡住。
+
+只有一个候选口时**不打开任何设备**就定下来,所以自动检测不会打扰正在跑的会话;插了
+两个 USB 串口适配器时才退回到只读 ping(问舵机型号,不上力矩、不发目标位),谁答话
+就是谁;还是分不出来就报错并列出候选,要求 `--port` 点名。
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/scan_devices.py          # 串口 + 相机,都列出来
+PYTHONPATH=src .venv/bin/python scripts/scan_devices.py --probe  # 顺带只读 ping 每个候选口
+export SO_SNAKE_ARM_PORT=/dev/cu.usbmodem58760434321             # 检测不对时的长期覆盖
+```
+
+macOS 上串口通常是 `/dev/cu.usbmodem*`(只用 `cu.`,`tty.` 会等载波信号)。首次使用必须先标定(会手动移动臂过全程),标定与
 第一次发力矩/运动都是操作者手动步骤,脚本不代劳。舵机 id 已是 1–6(preflight 探测
 确认),无需 `lerobot-setup-motors`,直接标定即可:
 
@@ -125,8 +144,8 @@ lerobot 标定后的度数(零位=量程中点)和本仓运动学用的 **URDF �
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py draft            # 零运动:从标定文件算 offset
-PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py signs --port <PORT>  # 手推到硬限位定 sign
-PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py check --port <PORT>  # 手扶核对映射
+PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py signs  # 手推到硬限位定 sign
+PYTHONPATH=src .venv/bin/python scripts/map_joint_frames.py check  # 手扶核对映射
 ```
 
 映射写到 `assets/so100_joint_map.json`。`SOFollowerBackend(joint_map=...)` 读时
@@ -141,7 +160,7 @@ lero→URDF、写时 URDF→lero(精确双射,读回即写不会跳)。
 
 ```bash
 PYTHONPATH=src .venv/bin/python scripts/teleop_real_arm.py \
-    --port <PORT> --max-relative-target 5 --steps 600
+    --max-relative-target 5 --steps 600
 ```
 
 `SOFollowerBackend` 用 lerobot 的 `SOFollowerRobotConfig`,`max_relative_target` 是
@@ -165,6 +184,17 @@ PYTHONPATH=src .venv/bin/python scripts/record_episode.py --backend mujoco --ste
 PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --list
 PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --check      # 只检查,不动
 PYTHONPATH=src .venv/bin/python scripts/replay_episode.py --id ep_... --backend mujoco --mode task
+```
+
+相机在命令行上用 `--camera <role>=<device>` 指派(`third_person` / `wrist`),
+`scripts/scan_devices.py` 会把每个 index 的缩略图写到 `data/device_scan/`,**按画面认
+相机**:macOS 上 OpenCV 的 index 既不对应设备名也不在重插后保持不变,认错了录出来的
+episode 看着没问题,要等有人看视频才发现。只插了一台相机时可以写 `=auto`,多于一台
+`auto` 会拒绝并列出候选 —— 这里宁可不认也不能猜。GUI 的「扫描相机」按钮同样是按缩略图选。
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/record_episode.py --backend real --source pro \
+    --camera third_person=0 --camera wrist=3 --task "把红色方块放进框里"
 ```
 
 有相机时每个视角多一个 `<role>.mp4`,**每个控制步写一帧**,所以 video 帧 *i* 就是
@@ -286,7 +316,10 @@ assets/urdf/so100/     SO-100 URDF 与网格(so100.urdf 已补 TCP,so100_origina
 assets/atlas/          SO-100 可行性图集
 assets/mujoco/         MuJoCo XML 模型
 assets/so100_joint_map.json    lerobot↔URDF 每关节映射(本臂标定产物;map_joint_frames.py 生成)
-assets/so100_start_pose.json   记录的 start pose(本臂;move_to_start / teleop 起始)
+assets/so100_start_pose.json   记录的 start pose(本臂;move_to_start / teleop 起始,
+                               也是 GUI「归位」的目标)。用
+                               `scripts/move_to_start.py --capture` 或 GUI 上的
+                               「记录当前位姿为归位点」按钮写入
 docs/                  设计决策记录
 scripts/               可复现的分析与验证脚本
 src/so_snake/          M0~M5 模块实现

@@ -12,8 +12,14 @@ device is one flag each:
     PYTHONPATH=src python scripts/record_episode.py --backend mujoco --source pro
 
     # the real arm. Read scripts/preflight_real_arm.py output first.
+    # The serial port is auto-detected; --port only to override it.
     PYTHONPATH=src python scripts/record_episode.py \\
-        --backend real --source pro --port /dev/ttyACM0 --task "pick the red cube"
+        --backend real --source pro --task "pick the red cube"
+
+    # with cameras. `scripts/scan_devices.py` writes a thumbnail per index so
+    # the right one gets the right role:
+    PYTHONPATH=src python scripts/record_episode.py --backend real --source pro \\
+        --camera third_person=0 --camera wrist=3
 
 Episodes land in `data/episodes/<id>/`. `scripts/replay_episode.py` plays them
 back; the GUI (`tools/gui`) does both with a button.
@@ -27,8 +33,32 @@ from pathlib import Path
 
 from so_snake.config import SoSnakeConfig
 from so_snake.data import DEFAULT_EPISODE_ROOT, EpisodeRecorder
-from so_snake.rig import DEFAULT_JOINT_MAP, RigSpec, build_backend, build_source
+from so_snake.devices import detect_arm_port, resolve_camera_specs
+from so_snake.m0_perception import CAMERA_ROLES, CameraSpec
+from so_snake.rig import DEFAULT_JOINT_MAP, RigSpec, build_backend, build_cameras, build_source
 from so_snake.teleop import TeleopLoop
+
+
+def camera_specs(assignments: list[str]) -> tuple[CameraSpec, ...]:
+    """Parse repeated `--camera role=device` flags into specs.
+
+    `device` is an index, a path, or `auto`. `auto` only resolves when exactly
+    one unclaimed camera is attached; with several it refuses and lists them,
+    because on macOS nothing can say which index is the wrist camera and a wrong
+    guess is silent -- see `so_snake.devices.resolve_camera_specs`.
+    """
+    parsed: dict[str, str] = {}
+    for item in assignments:
+        role, sep, device = item.partition("=")
+        if not sep or not role.strip():
+            raise SystemExit(f"--camera wants <role>=<device>, got {item!r}")
+        role = role.strip()
+        if role not in CAMERA_ROLES:
+            raise SystemExit(f"--camera role must be one of {CAMERA_ROLES}, got {role!r}")
+        if role in parsed:
+            raise SystemExit(f"--camera {role} given twice")
+        parsed[role] = device.strip()
+    return resolve_camera_specs(parsed)
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,8 +74,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=DEFAULT_EPISODE_ROOT)
     parser.add_argument("--no-realtime", action="store_true", help="do not pace to control_hz")
 
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=[],
+        metavar="ROLE=DEVICE",
+        help=f"assign a camera, e.g. --camera wrist=3 (roles: {', '.join(CAMERA_ROLES)}; "
+             "DEVICE may be 'auto' when only one camera is attached). Repeatable.",
+    )
+
     real = parser.add_argument_group("real arm")
-    real.add_argument("--port", default="", help="serial port, e.g. /dev/ttyACM0")
+    real.add_argument("--port", default="", help="serial port; auto-detected when omitted")
     real.add_argument("--id", dest="robot_id", default="so_snake", help="lerobot robot id")
     real.add_argument("--map", type=Path, default=DEFAULT_JOINT_MAP, help="joint-frame map JSON")
     real.add_argument("--max-relative-target", type=float, default=5.0,
@@ -66,10 +105,22 @@ def main() -> int:
         raise SystemExit("--steps must be positive")
 
     config = SoSnakeConfig()
+    try:
+        # Resolved before the spec is built, so the port that gets printed,
+        # confirmed and written into the episode metadata is the one the arm is
+        # actually driven through. Cameras likewise: a scan that cannot decide
+        # must fail here, not after the operator has typed 'yes'.
+        port = detect_arm_port(args.port) if args.backend == "real" else args.port
+        cameras = camera_specs(args.camera)
+    except Exception as exc:  # noqa: BLE001 - detection reports what it found
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
     spec = RigSpec(
         backend=args.backend,
         source=args.source,
-        port=args.port,
+        port=port,
+        cameras=cameras,
         robot_id=args.robot_id,
         joint_map_path=args.map,
         max_relative_target_deg=args.max_relative_target,
@@ -91,12 +142,14 @@ def main() -> int:
     print(f"source    {args.source}")
     print(f"steps     {args.steps} at {config.teleop.control_hz:g} Hz")
     print(f"root      {args.root}")
+    for camera in spec.cameras:
+        print(f"camera    {camera.role:<13} {camera.index_or_path}")
     if spec.is_physical:
         print()
         print("=" * 60)
         print("REAL ARM — it WILL move and torque WILL engage.")
         print("=" * 60)
-        print(f"  port                 {args.port}")
+        print(f"  port                 {spec.port}{'' if args.port else '  (auto-detected)'}")
         print(f"  max_relative_target  {args.max_relative_target:g} deg/step (hardware clamp)")
         print("  Clear the workspace. Keep a hand on the power. Motion only while ZL is held.")
         print("  This script starts teleop from the CURRENT pose; for the guided")
@@ -105,6 +158,26 @@ def main() -> int:
             print("aborted; nothing energized.")
             return 1
 
+    rig = build_cameras(spec)
+    try:
+        # After the confirmation, before the first frame: opening two USB
+        # cameras takes seconds, and an episode whose first second is missing a
+        # view is not one anybody can train on.
+        rig.connect()
+    except Exception as exc:  # noqa: BLE001
+        print(f"cameras: {type(exc).__name__}: {exc}", file=sys.stderr)
+        # Neither has been connected yet (the loop does that), so this is only
+        # to be sure nothing is left holding a device; it must not mask the
+        # camera error that is being reported.
+        for closer in (source.disconnect, backend.disconnect):
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+        return 2
+    if spec.cameras:
+        print(f"cameras open: {', '.join(rig.roles)}")
+
     recorder = EpisodeRecorder(
         args.root,
         config=config,
@@ -112,6 +185,7 @@ def main() -> int:
         source=args.source,
         simulated=not spec.is_physical,
         joint_names=backend.joint_names,
+        cameras=rig,
     )
     loop = TeleopLoop(source, backend, config)
 
@@ -135,7 +209,10 @@ def main() -> int:
             except Exception:  # noqa: BLE001
                 pass
 
+    # The recorder closes its video writers here, so the cameras are released
+    # after it and not before -- same order the GUI session tears down in.
     written = recorder.stop(keep=True)
+    rig.disconnect()
     if written is None:
         print("nothing recorded.")
         return rc or 1

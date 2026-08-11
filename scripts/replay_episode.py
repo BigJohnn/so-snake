@@ -13,7 +13,7 @@ Two modes, and they answer different questions:
     PYTHONPATH=src python scripts/replay_episode.py --id ep_20260727_143000 --check
     PYTHONPATH=src python scripts/replay_episode.py --id ep_... --backend mujoco
     PYTHONPATH=src python scripts/replay_episode.py --id ep_... --backend real \\
-        --port /dev/ttyACM0 --speed 0.5
+        --speed 0.5
 
 `--check` runs the static inspection and moves nothing. On the real arm, run it
 first: it reports joint-order mismatches, commands recorded outside the current
@@ -34,6 +34,7 @@ from so_snake.data import (
     ReplayConfig,
     inspect_episode,
 )
+from so_snake.devices import DeviceDetectionError, detect_arm_port
 from so_snake.rig import DEFAULT_JOINT_MAP, RigSpec, build_backend
 
 
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
                         help="skip the MuJoCo mesh clearance guard")
 
     real = parser.add_argument_group("real arm")
-    real.add_argument("--port", default="")
+    real.add_argument("--port", default="", help="serial port; auto-detected when omitted")
     real.add_argument("--id-robot", dest="robot_id", default="so_snake")
     real.add_argument("--map", type=Path, default=DEFAULT_JOINT_MAP)
     real.add_argument("--max-relative-target", type=float, default=5.0)
@@ -100,9 +101,18 @@ def main() -> int:
         print(f"task      {episode.meta.task}")
     print(f"replay    {args.mode} mode at {args.speed:g}x onto {args.backend}")
 
+    try:
+        # Detected here rather than inside `build_backend` so the port is known
+        # in time to be printed above the confirmation prompt, and so a machine
+        # with no arm attached says so before the episode is loaded onto it.
+        port = detect_arm_port(args.port) if args.backend == "real" else args.port
+    except DeviceDetectionError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+
     spec = RigSpec(
         backend=args.backend,
-        port=args.port,
+        port=port,
         robot_id=args.robot_id,
         joint_map_path=args.map,
         max_relative_target_deg=args.max_relative_target,
@@ -139,6 +149,7 @@ def main() -> int:
         print("=" * 60)
         print("REAL ARM — it WILL move, along the whole recorded trajectory.")
         print("=" * 60)
+        print(f"  port  {spec.port}{'' if args.port else '  (auto-detected)'}")
         print("  The arm first walks to the episode's first pose, then plays it back.")
         print("  Clear the workspace and keep a hand on the power.")
         if not args.yes and input("\nType 'yes' to connect: ").strip().lower() not in ("y", "yes"):

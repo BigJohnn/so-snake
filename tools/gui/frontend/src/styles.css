@@ -205,6 +205,9 @@ td.num, th.num { font-family: var(--mono); text-align: right; }
 .plot { width: 100%; display: block; }
 .plot-title { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); margin-bottom: 3px; font-family: var(--mono); }
 
+/* A detected serial port, offered as a one-click fill of the port field. */
+.btn.picked { border-color: var(--accent); color: var(--accent); }
+
 /* Camera picking is done by looking at the thumbnails: on macOS a device index
    carries no name, and two identical cameras differ only in what they see. */
 .camera-pick { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
