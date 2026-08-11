@@ -23,7 +23,11 @@ export function ReplayPage({
   const [episodes, setEpisodes] = useState<EpisodeMeta[]>([]);
   const [episodeId, setEpisodeId] = useState("");
   const [rig, setRig] = useState<RigState>({ ...DEFAULT_RIG });
-  const [mode, setMode] = useState<ReplayMode>("joint");
+  // task, not joint: the question worth asking of a recording on this bench is
+  // "would today's controller do the same thing", which is the regression test
+  // for a change to the IK, the projector or the atlas. Joint mode is still one
+  // click away when the question is about the hardware instead.
+  const [mode, setMode] = useState<ReplayMode>("task");
   const [speed, setSpeed] = useState(1);
   const [error, setError] = useState("");
 

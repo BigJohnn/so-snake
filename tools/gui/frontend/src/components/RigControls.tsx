@@ -12,9 +12,15 @@ export interface RigState {
   cameras: Record<CameraRole, string>;
 }
 
+// What this bench actually does: the real arm, driven by the Pro controller.
+// Defaulting to the simulator meant selecting hardware by hand every session,
+// which is friction on the common path and not much of a safety measure -- the
+// real backend has its own warning banner, its per-step clamp, and a clutch
+// that has to be held before anything moves. The port is left blank on purpose;
+// it is detected (see so_snake.devices).
 export const DEFAULT_RIG: RigState = {
-  backend: "mujoco",
-  source: "scripted",
+  backend: "real",
+  source: "pro",
   port: "",
   maxRelativeTarget: 5,
   // No camera is opened until the operator picks one. Guessing would mean
