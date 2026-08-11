@@ -4,6 +4,32 @@ import { SeriesPlot } from "../components/SeriesPlot";
 import { Banner, Card, Empty, Field, Pill, Stat } from "../components/ui";
 import type { EpisodeDetail, EpisodeMeta } from "../types";
 
+/* The dataset page is a triage bench, not a table.
+ *
+ * What actually happens here: a session just produced fifteen takes, and the
+ * operator has to decide which ones are worth training on. That decision is
+ * made by *watching* a take -- did the grasp land, did the arm clip the bin --
+ * and then keeping it, deleting it, or writing down what it shows. The plots
+ * matter afterwards, when a take looks wrong and the question becomes why.
+ *
+ * So the layout follows the loop rather than the data model:
+ *
+ *   * the list is a column that stays put, so choosing a take never scrolls the
+ *     take away; arrow keys walk it, which is how fifteen of them get reviewed;
+ *   * the video is the largest thing on the page, because it is the evidence;
+ *   * the verdict (delete) and the label (task) sit next to the video, where the
+ *     judgement is actually formed -- not in a toolbar above a table;
+ *   * deleting selects the next take, because the operator is working down a
+ *     list, not managing files;
+ *   * the plots keep the shared cursor and go underneath; the diagnostics that
+ *     answer "why" fold away until asked for.
+ *
+ * The previous version was a wide table stacked on a two-column detail, and the
+ * detail had three children in a two-column grid -- so the trajectory card, the
+ * widest thing on the page, wrapped into the 320px sidebar column while the
+ * video sat alone in the wide one.
+ */
+
 const SUMMARY_KEYS: [string, string, string][] = [
   ["ik_pos_err_p95_mm", "IK 位置误差 p95", "mm"],
   ["ik_pitch_err_p95_deg", "pitch 误差 p95", "°"],
@@ -51,90 +77,124 @@ export function EpisodesPage() {
     };
   }, [selected]);
 
+  /* Arrow keys walk the list. Reviewing a session means going through every
+   * take in order, and reaching for the mouse between each one is the friction
+   * that stops people from reviewing at all. Ignored while typing, so the task
+   * field still behaves like a text field. */
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      const step = event.key === "ArrowDown" || event.key === "j" ? 1 : event.key === "ArrowUp" || event.key === "k" ? -1 : 0;
+      if (step === 0 || episodes.length === 0) return;
+      event.preventDefault();
+      const at = episodes.findIndex((e) => e.id === selected);
+      const next = Math.min(episodes.length - 1, Math.max(0, (at < 0 ? 0 : at) + step));
+      setSelected(episodes[next].id);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [episodes, selected]);
+
   const remove = async (id: string) => {
-    if (!window.confirm(`删除 ${id}?此操作不可撤销。`)) return;
+    if (!window.confirm(`删除 ${id}?此操作不可撤销(含视频)。`)) return;
+    // Land on the neighbour rather than back at the top: the operator is working
+    // down a list, and a delete is a step in that walk, not a return to the start.
+    const at = episodes.findIndex((e) => e.id === id);
+    const neighbour = episodes[at + 1]?.id ?? episodes[at - 1]?.id ?? "";
     try {
       await api.deleteEpisode(id);
+      setSelected(neighbour);
       await reload();
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : String(cause));
     }
   };
 
+  const totalSeconds = episodes.reduce((sum, e) => sum + e.duration_s, 0);
+
   return (
-    <div className="grid">
+    <>
       {error ? <Banner tone="error">{error}</Banner> : null}
-
-      <Card
-        title={`数据集 (${episodes.length} 条)`}
-        padded={false}
-        actions={
-          <button className="btn small" onClick={() => void reload()}>
-            刷新
-          </button>
-        }
-      >
-        {episodes.length === 0 ? (
-          <Empty>还没有录制。到「遥操作 / 录制」页启动会话并按录制。</Empty>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>id</th>
-                <th>任务 / 名称</th>
-                <th>来源</th>
-                <th className="num">帧数</th>
-                <th className="num">时长</th>
-                <th className="num">IK p95</th>
-                <th>录制于</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {episodes.map((episode) => (
-                <tr
+      <div className="dataset">
+        <aside className="card take-list">
+          <header>
+            <h2>数据集</h2>
+            <div className="spacer">
+              <button className="btn small" onClick={() => void reload()}>
+                刷新
+              </button>
+            </div>
+          </header>
+          <div className="take-list-meta">
+            {episodes.length} 条 · 共 {formatDuration(totalSeconds)}
+            {episodes.length > 1 ? <span className="dim"> · ↑↓ 切换</span> : null}
+          </div>
+          <div className="take-scroll">
+            {episodes.length === 0 ? (
+              <Empty>还没有录制。到「遥操作 / 录制」页启动会话并按录制。</Empty>
+            ) : (
+              episodes.map((episode) => (
+                <TakeRow
                   key={episode.id}
-                  className={episode.id === selected ? "selected" : ""}
-                  onClick={() => setSelected(episode.id)}
-                >
-                  <td className="mono small">{episode.id}</td>
-                  <td>
-                    {episode.task || <span className="dim">未标注任务</span>}
-                    {episode.name ? <span className="dim small"> · {episode.name}</span> : null}
-                    {episode.aborted_reason ? (
-                      <div>
-                        <Pill tone="warn">{episode.aborted_reason}</Pill>
-                      </div>
-                    ) : null}
-                  </td>
-                  <td>
-                    <Pill tone={episode.simulated ? "accent" : "danger"}>{episode.backend}</Pill>{" "}
-                    <span className="dim small">{episode.source}</span>
-                  </td>
-                  <td className="num">{episode.n_steps}</td>
-                  <td className="num">{episode.duration_s.toFixed(1)}s</td>
-                  <td className="num">{fmt(episode.summary.ik_pos_err_p95_mm, 3)}</td>
-                  <td className="mono small dim">{episode.created_at.replace("T", " ").slice(0, 19)}</td>
-                  <td>
-                    <button
-                      className="btn small danger"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void remove(episode.id);
-                      }}
-                    >
-                      删除
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </Card>
+                  episode={episode}
+                  selected={episode.id === selected}
+                  onSelect={() => setSelected(episode.id)}
+                />
+              ))
+            )}
+          </div>
+        </aside>
 
-      {detail ? <Detail detail={detail} joint={joint} onJoint={setJoint} onSaved={reload} /> : null}
-    </div>
+        <div className="grid" style={{ alignContent: "start", minWidth: 0 }}>
+          {detail ? (
+            <Detail
+              detail={detail}
+              joint={joint}
+              onJoint={setJoint}
+              onSaved={reload}
+              onDelete={() => void remove(detail.meta.id)}
+            />
+          ) : (
+            <Card title="预览">
+              <Empty>{episodes.length ? "选一条看看" : "还没有可看的 episode"}</Empty>
+            </Card>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/** One take in the list: what it is, then how big it is. Two lines, no columns.
+ *
+ * A table row makes every field equally prominent; here they are not. The task
+ * is what the operator is looking for, and the rest is context they only need
+ * once they have found it. */
+function TakeRow({
+  episode,
+  selected,
+  onSelect
+}: {
+  episode: EpisodeMeta;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const hasVideo = Object.keys(episode.video?.cameras ?? {}).length > 0;
+  return (
+    <button className={`take${selected ? " selected" : ""}`} onClick={onSelect}>
+      <div className="title">
+        {episode.task || episode.name || <span className="dim">未标注</span>}
+        {episode.aborted_reason ? <span className="flag" title={episode.aborted_reason}>⚠</span> : null}
+      </div>
+      <div className="meta mono">
+        <span className={episode.simulated ? "accent" : "physical"}>{episode.backend}</span>
+        <span>{episode.duration_s.toFixed(1)}s</span>
+        <span>{episode.n_steps} 帧</span>
+        {hasVideo ? <span title="有相机录像">▣</span> : null}
+        <span className="when">{shortTime(episode.created_at)}</span>
+      </div>
+    </button>
   );
 }
 
@@ -176,9 +236,9 @@ function EpisodeVideos({
   }, [index, fps]);
 
   return (
-    <div className={`grid${cameras.length > 1 ? " cols-2" : ""}`}>
+    <div className="videos" style={{ gridTemplateColumns: `repeat(${cameras.length}, minmax(0, 1fr))` }}>
       {cameras.map((role, i) => (
-        <div className="preview" key={role}>
+        <div className="preview" key={`${id}:${role}`}>
           <video
             ref={(node) => {
               refs.current[role] = node;
@@ -204,12 +264,14 @@ function Detail({
   detail,
   joint,
   onJoint,
-  onSaved
+  onSaved,
+  onDelete
 }: {
   detail: EpisodeDetail;
   joint: number;
   onJoint: (index: number) => void;
   onSaved: () => Promise<void>;
+  onDelete: () => void;
 }) {
   const [task, setTask] = useState(detail.meta.task);
   const [notes, setNotes] = useState(detail.meta.notes);
@@ -235,82 +297,98 @@ function Detail({
   const cursor = Math.round(row / Math.max(1, s.stride));
   const scrub = (i: number) => setRow(i * s.stride);
   const column = (rows: number[][], index: number) => rows.map((row) => row[index]);
+  const dirty = task !== detail.meta.task || notes !== detail.meta.notes;
+
+  const save = async () => {
+    await api.annotate(detail.meta.id, { task, notes });
+    await onSaved();
+    setSaved(true);
+  };
 
   return (
-    <div className="grid cols-2" style={{ gridTemplateColumns: "320px minmax(0, 1fr)" }}>
-      <div className="grid" style={{ alignContent: "start" }}>
-        <Card title="标注">
-          <Field label="任务描述">
-            <input value={task} onChange={(event) => setTask(event.target.value)} />
-          </Field>
-          <Field label="备注">
-            <textarea rows={3} value={notes} onChange={(event) => setNotes(event.target.value)} />
-          </Field>
+    <>
+      {/* The take itself: what it is, what to do about it, and the evidence.
+          One card, because judging a take is one action, not three panels. */}
+      <section className="card">
+        <div className="take-head">
+          <div className="ident">
+            <span className="mono id">{detail.meta.id}</span>
+            <Pill tone={detail.meta.simulated ? "accent" : "danger"}>{detail.meta.backend}</Pill>
+            <Pill>{detail.meta.source}</Pill>
+            {detail.meta.aborted_reason ? (
+              <Pill tone="warn">{detail.meta.aborted_reason}</Pill>
+            ) : null}
+          </div>
           <div className="row">
-            <button
-              className="btn primary"
-              onClick={async () => {
-                await api.annotate(detail.meta.id, { task, notes });
-                await onSaved();
-                setSaved(true);
-              }}
-            >
-              保存标注
+            {saved && !dirty ? <Pill tone="ok">已保存</Pill> : null}
+            <button className="btn small danger" onClick={onDelete} title="连同视频一起从磁盘删除">
+              删除这条
             </button>
-            {saved ? <Pill tone="ok">已保存</Pill> : null}
           </div>
-          <div className="dim small" style={{ marginTop: 10 }}>
-            只改标签。帧数据和配置快照是录制时的事实,不可编辑。
-          </div>
-        </Card>
+        </div>
 
-        <Card title="录制条件" padded={false}>
-          <div className="stats">
-            <Stat label="帧数" value={detail.meta.n_steps} small />
-            <Stat label="时长" value={detail.meta.duration_s.toFixed(1)} unit="s" small />
-            <Stat label="控制频率" value={detail.meta.control_hz} unit="Hz" small />
-            <Stat label="磁盘" value={(detail.size_bytes / 1024).toFixed(0)} unit="KB" small />
-            <Stat label="列数" value={detail.columns.length} small />
-            <Stat label="采样步长" value={`1/${s.stride}`} small />
-          </div>
-        </Card>
-
-        <Card title="指标" padded={false}>
-          <div className="stats">
-            {SUMMARY_KEYS.filter(([key]) => key in detail.meta.summary).map(([key, label, unit]) => (
-              <Stat
-                key={key}
-                label={label}
-                value={unit === "%" ? (detail.meta.summary[key] * 100).toFixed(1) : fmt(detail.meta.summary[key], 3)}
-                unit={unit}
-                small
-              />
-            ))}
-          </div>
-        </Card>
-      </div>
-
-      {videoCameras.length ? (
-        <Card
-          title="相机"
-          actions={
-            <span className="dim small">
-              第 {row + 1} / {detail.meta.n_steps} 帧 · t = {(s.t[Math.min(cursor, s.t.length - 1)] ?? 0).toFixed(2)} s
-              {" · "}点击下方曲线可定位
-            </span>
-          }
-        >
-          <EpisodeVideos
-            id={detail.meta.id}
-            cameras={videoCameras}
-            fps={fps}
-            index={row}
-            onIndex={setRow}
+        <div className="take-label">
+          <input
+            value={task}
+            placeholder="这条演示的是什么?(训练时的 language instruction)"
+            onChange={(event) => setTask(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void save();
+            }}
           />
-        </Card>
-      ) : null}
+          <button className="btn primary" disabled={!dirty} onClick={() => void save()}>
+            保存标注
+          </button>
+        </div>
 
-      <Card title={`轨迹 · ${detail.meta.id}`}>
+        <div className="take-facts mono">
+          <span>{detail.meta.n_steps} 帧</span>
+          <span>{detail.meta.duration_s.toFixed(1)} s</span>
+          <span>{detail.meta.control_hz} Hz</span>
+          <span>{(detail.size_bytes / 1024 / 1024).toFixed(1)} MB</span>
+          <span className="dim">{detail.meta.created_at.replace("T", " ").slice(0, 19)}</span>
+        </div>
+
+        {videoCameras.length ? (
+          <>
+            <EpisodeVideos
+              id={detail.meta.id}
+              cameras={videoCameras}
+              fps={fps}
+              index={row}
+              onIndex={setRow}
+            />
+            <div className="scrub">
+              <button className="btn small" onClick={() => setRow(Math.max(0, row - 1))}>
+                ◀
+              </button>
+              <button
+                className="btn small"
+                onClick={() => setRow(Math.min(detail.meta.n_steps - 1, row + 1))}
+              >
+                ▶
+              </button>
+              <input
+                type="range"
+                min={0}
+                max={Math.max(0, detail.meta.n_steps - 1)}
+                value={row}
+                onChange={(event) => setRow(Number(event.target.value))}
+              />
+              <span className="mono small dim">
+                第 {row + 1} / {detail.meta.n_steps} 帧 ·{" "}
+                {(s.t[Math.min(cursor, s.t.length - 1)] ?? 0).toFixed(2)} s
+              </span>
+            </div>
+          </>
+        ) : (
+          <div className="no-video">
+            这条没有相机录像 —— 录制时没有指派相机。下面的曲线仍然可用。
+          </div>
+        )}
+      </section>
+
+      <Card title="轨迹" actions={<span className="dim small">点曲线可定位到那一帧</span>}>
         <SeriesPlot
           cursor={videoCameras.length ? cursor : null}
           onScrub={videoCameras.length ? scrub : undefined}
@@ -349,6 +427,8 @@ function Detail({
           ))}
         </div>
         <SeriesPlot
+          cursor={videoCameras.length ? cursor : null}
+          onScrub={videoCameras.length ? scrub : undefined}
           x={s.t}
           series={[
             { label: "指令", values: column(s.commanded_joints_deg, joint) },
@@ -358,12 +438,16 @@ function Detail({
           height={130}
         />
         <SeriesPlot
+          cursor={videoCameras.length ? cursor : null}
+          onScrub={videoCameras.length ? scrub : undefined}
           x={s.t}
           series={[{ label: "夹爪指令", values: s.gripper_deg }]}
           unit="deg"
           height={90}
         />
         <SeriesPlot
+          cursor={videoCameras.length ? cursor : null}
+          onScrub={videoCameras.length ? scrub : undefined}
           x={s.t}
           series={[{ label: "IK 位置误差", values: s.pos_err_mm }]}
           bands={[{ values: s.workspace_clamped }, { values: s.command_safety_held }]}
@@ -372,11 +456,60 @@ function Detail({
           yMin={0}
         />
       </Card>
-    </div>
+
+      {/* Answers "why was this take bad", which is a question that only comes up
+          after the video has already been watched. Folded until then. */}
+      <details className="card fold">
+        <summary>指标与备注</summary>
+        <div className="stats">
+          {SUMMARY_KEYS.filter(([key]) => key in detail.meta.summary).map(([key, label, unit]) => (
+            <Stat
+              key={key}
+              label={label}
+              value={
+                unit === "%"
+                  ? (detail.meta.summary[key] * 100).toFixed(1)
+                  : fmt(detail.meta.summary[key], 3)
+              }
+              unit={unit}
+              small
+            />
+          ))}
+        </div>
+        <div className="body">
+          <Field label="备注" hint="只改标签。帧数据和配置快照是录制时的事实,不可编辑。">
+            <textarea rows={3} value={notes} onChange={(event) => setNotes(event.target.value)} />
+          </Field>
+          <div className="row">
+            <button className="btn" disabled={!dirty} onClick={() => void save()}>
+              保存标注
+            </button>
+            <span className="dim small">
+              采样步长 1/{s.stride} · {detail.columns.length} 列
+            </span>
+          </div>
+        </div>
+      </details>
+    </>
   );
 }
 
 const toDeg = (v: number) => (v * 180) / Math.PI;
+
+/** HH:MM for a take from today, MM-DD for an older one.
+ *
+ * The list is one session's worth of takes nine times out of ten, and then the
+ * clock is what tells them apart; the tenth time it is last week's, and then the
+ * date is the only thing that matters. */
+function shortTime(createdAt: string): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return createdAt.slice(0, 10) === today ? createdAt.slice(11, 16) : createdAt.slice(5, 10);
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 90) return `${seconds.toFixed(0)} s`;
+  return `${Math.floor(seconds / 60)} min ${Math.round(seconds % 60)} s`;
+}
 
 function fmt(value: number | undefined, digits: number): string {
   return value === undefined || !Number.isFinite(value) ? "—" : value.toFixed(digits);
