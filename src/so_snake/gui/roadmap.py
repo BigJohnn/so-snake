@@ -121,8 +121,9 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 "cannot buy a burst of unpaced commands.",
                 module="so_snake.pacing",
                 evidence="mock backend measured 30.00 Hz over 200 steps (was 26.8); "
-                         "43 recorded takes sit at 26.3 Hz median and are the reason "
-                         "the exporter measures the rate instead of reading the config",
+                         "the 44 takes on this bench were all recorded before the fix "
+                         "and sit at 26.1 Hz median (25.8-26.9), which is why the "
+                         "exporter measures the rate instead of reading the config",
             ),
             _item(
                 "joint-map", "lerobot ↔ URDF joint map", "done",
@@ -199,8 +200,8 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 "from the CLI. The lerobot import is lazy, so recording keeps its "
                 "numpy-only dependency surface.",
                 module="so_snake.data.export",
-                evidence="牛牛抓放 dry-run: 41 usable takes / 20043 frames at 26 Hz; "
-                         "worst rate deviation 1.6%",
+                evidence="牛牛抓放 dry-run: 40 usable takes / 19491 frames at 26 Hz; "
+                         "takes ran 26.27-26.59 Hz, worst deviation 2.3%",
             ),
             _item(
                 "export-verify", "Exports are read back before they are trusted", "done",
@@ -212,12 +213,49 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 "repeated -- it is the only check that can see a missing parquet "
                 "footer (LeRobotDataset.finalize was never being called), a video a "
                 "frame short, or a timestamp grid built from a rate nothing ran at. "
-                "All three look like success at the moment of writing.",
+                "All three look like success at the moment of writing.\n\n"
+                "Failure and gap are separate verdicts. An issue is a check that ran "
+                "and the dataset lost, against a reference inside it -- the rows, the "
+                "timestamp grid, the manifest's own episode count -- and blocks "
+                "training. A skip is a check that could not run because something "
+                "outside the dataset was absent: no export.json, no store, or a source "
+                "take since deleted. That last one used to be an issue, which was "
+                "wrong: deleting a take changes no byte of the dataset, and a verdict "
+                "that turns red because another directory changed is not a statement "
+                "about the dataset -- the same export would read green on the bench "
+                "that still holds the takes and red on the training box that never "
+                "had them. Those read PARTIAL, with the unresolvable takes named and "
+                "episodes_compared saying how much of the dataset the error figures "
+                "actually cover.",
                 module="so_snake.data.export",
                 evidence="1672-row export reconstructs its targets to 0.010 um / "
                          "12 udeg, timestamps within 0.9 us of frame_index/fps, "
                          "1672 video frames on both cameras; a video truncated to 500 "
-                         "frames is rejected",
+                         "frames is rejected; a one-episode export whose source take "
+                         "was deleted afterwards reads PARTIAL at 0/1 compared, not "
+                         "FAILED",
+            ),
+            _item(
+                "verdict-cache", "The verify verdict is cached, and says when to distrust it",
+                "done",
+                "Verifying decodes every frame of every video -- minutes on a "
+                "20 000-frame dataset -- so the answer is stored as verify.json inside "
+                "the dataset it is about, and the library view shows a badge per "
+                "dataset without re-reading them all on every page load. Two things "
+                "keep the cache honest: a version stamp, so a verdict computed by "
+                "checks that have since changed meaning is discarded rather than "
+                "migrated, and the dataset's newest mtime, so bytes rewritten since "
+                "read as stale rather than as still-good.\n\n"
+                "The mtime deliberately excludes verify.json itself. Counting it made "
+                "the check self-defeating -- the mtime goes into the file before the "
+                "file is written, so the write became the newest thing under the "
+                "dataset and every verdict came back \"changed since verified\" within "
+                "a second of being computed. Every dataset in the library showed 过期 "
+                "and re-verifying could not clear it.",
+                module="so_snake.gui.exporter",
+                evidence="tests/test_gui_datasets.py covers a fresh verdict not being "
+                         "stale, a genuine rewrite being stale, and a verdict from "
+                         "another schema version being discarded",
             ),
             _item(
                 "dataset-replay", "Replaying an exported dataset onto the arm", "done",
@@ -253,16 +291,81 @@ ROADMAP: tuple[dict[str, Any], ...] = (
             ),
             _item(
                 "task-labels", "Task-labelled training batch", "done",
-                "The 33 previously unlabelled takes have been assigned the 牛牛抓放 "
-                "task label. Export screening now selects them by task; two are "
-                "still rejected because they have no third-person camera.",
+                "The previously unlabelled batch was assigned the 牛牛抓放 task label, "
+                "and export screening selects by task. A count here is a snapshot of "
+                "what is on the bench, not a fixed claim -- takes get recorded and "
+                "deleted between sessions.",
                 module="so_snake.data.store",
-                evidence="43 labelled takes, 41 pass export screening",
+                evidence="44 takes on disk: 42 labelled 牛牛抓放 (40 pass export "
+                         "screening, 2 have no third-person camera), 2 one-off labels; "
+                         "40 usable takes = 19491 frames = 12.4 min at 26 Hz",
             ),
             _item(
                 "qc", "Automatic take review", "todo",
                 "Flag takes with clamped stretches, held commands or a lost clutch, so a "
                 "bad demonstration is caught at the bench and not in training.",
+            ),
+        ),
+    },
+    {
+        # Separate from "M2 three-headed VLA" on purpose. This is the baseline
+        # policy the training set was built for, and it is the piece with the
+        # nearest open item -- keeping it inside a single "M2 todo" row hid both
+        # the settled contract and the one thing that is actually missing.
+        "group": "ACT baseline",
+        "items": (
+            _item(
+                "act-contract", "State / action contract for training", "done",
+                "The recorded format is deliberately redundant -- three action "
+                "streams -- and a training set has to pick one. State is "
+                "FK(measured joints), not the IK solution's own forward kinematics "
+                "(that column's distance to the target is the solver residual, 1e-6 "
+                "on this bench; the arm's real distance is 9.6 mm median). The delta "
+                "action is anchored on that reached pose rather than on the previous "
+                "target, so a rollout re-references the measurement every step "
+                "instead of integrating open-loop. The gripper stays absolute in both "
+                "spaces. `export.apply_action` is the inverse, so training and rollout "
+                "cannot drift apart.",
+                module="so_snake.data.export",
+                evidence="docs/act_baseline.md; anchoring on the measurement drops "
+                         "all-zero action steps from 25% to 0.1%",
+            ),
+            _item(
+                "act-train", "ACT trains on this laptop", "done",
+                "Measured on the machine, not estimated: ACT (ResNet18 x2 cameras, "
+                "52 M params) on M1 Pro / 16 GB via MPS. 240x320 is the export default "
+                "because the 26 Hz control period is 38 ms and ACT re-plans a whole "
+                "chunk every n_action_steps -- 480x640's 56 ms does not fit in a "
+                "period, 240x320's 22 ms does.",
+                evidence="316 ms/step on the exported dataset (updt_s 0.313, "
+                         "data_s 0.005 -- two video streams fully overlapped by the "
+                         "dataloader), ~1 GB MPS; 20k steps in 1.7 h",
+            ),
+            _item(
+                "rollout", "Rollout runner (policy → arm)", "todo",
+                "Policy output through apply_action into a 5D target, then the "
+                "existing atlas / IK / rate-limit / clearance layer onto the arm. "
+                "EpisodeReplayer is structurally the same loop with the targets "
+                "coming from a network instead of a file, so its safety layer is "
+                "reusable whole rather than re-derived; the new part is holding the "
+                "last command across the ~22 ms re-planning stall instead of blocking "
+                "the loop.",
+                blockers=("not written",),
+                evidence="docs/act_baseline.md 'Where to pick up'",
+            ),
+            _item(
+                "more-takes", "Wider training set", "todo",
+                "40 usable takes of one task is close to the LeRobot SO-100 tutorial "
+                "baseline in count but narrow in object placement. Two properties of "
+                "the original 10-take validation set are worth re-checking on the "
+                "larger batch before recording more, because a policy learns both "
+                "faithfully: 26% of steps sat pinned at the pitch limit with the atlas "
+                "clamping pitch on 56% of them, and x rode the workspace floor "
+                "(0.170-0.219 m against a 0.17 m minimum, clamp firing on 3-13% of "
+                "steps). Neither has been re-measured over the 40.",
+                blockers=("needs the arm, and varied object placement",),
+                evidence="40 takes / 19491 frames / 12.4 min at 26 Hz today; the "
+                         "pitch/x figures above are from the 10-take set",
             ),
         ),
     },

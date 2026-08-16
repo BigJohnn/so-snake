@@ -178,8 +178,9 @@ reports the jaws stalling on an object.
 ### Why the frame rate is measured
 
 **Superseded in part, 2026-08-16 — the loop now holds 30 Hz.** What follows
-still describes the 43 takes recorded before that, which are the training set as
-it stands. See "The two rate batches" below.
+still describes the takes recorded before that, which are the training set as it
+stands: every one of the 44 takes on the bench is from that batch. See "The two
+rate batches" below.
 
 The loop was configured for 30 Hz and held 26.1. Recording wrote the
 *configured* rate into the mp4 headers, so the videos claim to be 15 % shorter
@@ -277,10 +278,14 @@ HF_LEROBOT_HOME=data/lerobot .venv/bin/lerobot-train \
 
 ## What the data looks like, and what is wrong with it
 
-Exportable `牛牛抓放` set after labelling the unlabelled batch: 41 takes,
-20043 frames, ~12.9 minutes at 26 Hz. Gripper spans 2–90 deg, closed 38 % of
-steps, 86 open/close crossings. This is now close to the LeRobot SO-100 tutorial
-baseline's 50 takes in count, but still narrow in object placement.
+Exportable `牛牛抓放` set after labelling the unlabelled batch: **40 takes,
+19491 frames, ~12.4 minutes at 26 Hz** (42 labelled, 2 rejected for having no
+third-person camera; 44 takes on the bench in total). Gripper spans 2–90 deg,
+closed 38 % of steps, 84 open/close crossings. This is now close to the LeRobot
+SO-100 tutorial baseline's 50 takes in count, but still narrow in object
+placement. Counts are a snapshot of the bench, not a fixed property of the
+project — takes get recorded and deleted between sessions, so re-run
+`--dry-run` rather than trusting this line.
 
 Two things about the original 10-take validation set are worth checking against
 the larger labelled batch before recording more, because a policy will learn

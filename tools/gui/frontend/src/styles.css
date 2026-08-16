@@ -218,7 +218,10 @@ ul.tight li { margin: 2px 0; }
 .roadmap-item { padding: 11px 14px; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: 76px 1fr; gap: 12px; }
 .roadmap-item:last-child { border-bottom: none; }
 .roadmap-item .title { font-weight: 500; }
-.roadmap-item .detail { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+/* pre-wrap so an item can hold more than one paragraph: the entries that record
+   *why* a rule is drawn where it is (failure vs gap in verify, for one) need the
+   break, and a single-paragraph detail renders exactly as before. */
+.roadmap-item .detail { color: var(--muted); font-size: 12.5px; margin-top: 3px; white-space: pre-wrap; }
 .roadmap-item .meta { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-top: 5px; }
 
 .plot { width: 100%; display: block; }
