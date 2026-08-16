@@ -56,6 +56,18 @@ PHASES = ("idle", "exporting", "verifying", "done", "failed", "cancelled")
 # since it was verified shows as stale rather than as still-good.
 VERDICT_NAME = "verify.json"
 
+# Bumped whenever the verdict payload changes shape or a check changes meaning.
+#
+# A cached verdict is an answer computed by a particular version of `verify`.
+# When that code changes, the old answer is not merely missing a field -- it is
+# a claim made by checks that no longer exist in the form they were run. So a
+# verdict written under a different version is discarded rather than migrated,
+# and the dataset reads as "not verified yet". The cost is one re-verify; the
+# alternative is a green badge attesting to a check that was never run. (This
+# already bit once: `skipped` was added to the report, and verdicts written
+# before it lacked the field that decides OK from PARTIAL.)
+VERDICT_VERSION = 1
+
 
 @dataclass
 class ExportProgress:
@@ -174,7 +186,7 @@ class Exporter:
         synthesized ones; the GUI uses that to decide whether to show
         "原始 take"折叠面板.
         """
-        from ..data.export import _dataset_meta
+        from ..data.export import dataset_meta
 
         root = self.dataset_root
         if not root.is_dir():
@@ -198,7 +210,7 @@ class Exporter:
                 "verdict": None,
             }
             try:
-                manifest, ours = _dataset_meta(path)
+                manifest, ours = dataset_meta(path)
                 entry["manifest"] = manifest
                 entry["ours"] = ours
             except (FileNotFoundError, ValueError, OSError):
@@ -210,17 +222,27 @@ class Exporter:
         return {"datasets": found, "root": str(root)}
 
     def _read_verdict(self, path: Path) -> dict[str, Any] | None:
-        """The stored verify result, marked stale if the dataset changed since."""
+        """The stored verify result, or None if it cannot be trusted.
+
+        None covers three cases that all mean the same thing to the operator --
+        "this has not been verified by the code now running": no file, an
+        unreadable one, and one written under a different `VERDICT_VERSION`.
+        `stale` is the softer case: the verdict is this version's, but the
+        dataset has been written to since, so the answer is about older bytes.
+        """
         file = path / VERDICT_NAME
         try:
             verdict = json.loads(file.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
+            return None
+        if not isinstance(verdict, dict) or verdict.get("version") != VERDICT_VERSION:
             return None
         verdict["stale"] = float(verdict.get("verified_mtime", -1)) < _directory_mtime(path) - 1.0
         return verdict
 
     def _write_verdict(self, path: Path, report: VerifyReport) -> None:
         payload = _verify_payload(report)
+        payload["version"] = VERDICT_VERSION
         payload["verified_at"] = time.time()
         payload["verified_mtime"] = _directory_mtime(path)
         try:
@@ -233,17 +255,36 @@ class Exporter:
             pass
 
     def resolve(self, name_or_path: str) -> Path:
-        """A dataset name from the UI back to a path inside the root.
+        """A dataset name from the UI back to a path *inside* the root.
 
         Names come off the wire, so this refuses anything that would leave the
         root rather than trusting the caller not to send `../`.
+
+        It also refuses the root itself, which is not a nicety. `data/lerobot`
+        is a container of datasets, and `Path("")` and `Path(".")` both join to
+        it -- so a caller that omitted the field, or sent an undefined one that
+        JSON dropped, used to get the container back and have it opened as a
+        dataset. The failure then surfaced three layers down as "meta/info.json
+        is missing", which describes the root accurately and explains nothing.
+        A missing name is a missing name, and it should say so here.
         """
-        candidate = Path(name_or_path)
-        path = candidate if candidate.is_absolute() else (self.dataset_root / candidate)
-        path = path.resolve()
+        name = str(name_or_path).strip()
         root = self.dataset_root.resolve()
-        if path != root and root not in path.parents:
-            raise ValueError(f"{name_or_path!r} is not inside {root}")
+        if not name or name in (".", "/"):
+            raise ValueError(
+                "no dataset was named. Pick one from the library -- "
+                f"{root} is the directory they live in, not a dataset itself"
+            )
+
+        candidate = Path(name)
+        path = (candidate if candidate.is_absolute() else (self.dataset_root / candidate)).resolve()
+        if path == root:
+            raise ValueError(
+                f"{root} is the dataset root, not a dataset. Name one of the "
+                "directories inside it"
+            )
+        if root not in path.parents:
+            raise ValueError(f"{name!r} is not inside {root}")
         if not path.is_dir():
             raise FileNotFoundError(f"no dataset at {path}")
         return path

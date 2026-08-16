@@ -34,9 +34,9 @@ from so_snake.data import (
     EpisodeReplayer,
     EpisodeStore,
     ReplayConfig,
+    dataset_meta,
     format_verify,
     inspect_episode,
-    read_manifest,
     verify,
 )
 from so_snake.data.export import episode_from_dataset
@@ -78,23 +78,33 @@ def main() -> int:
     args = parse_args()
     config = SoSnakeConfig()
 
+    # `dataset_meta`, not `read_manifest`: a dataset without our `export.json`
+    # -- foreign, legacy, or one whose manifest was lost -- still has lerobot's
+    # `meta/info.json`, which carries everything replay needs. The GUI already
+    # falls back that way, and a CLI that refused what the GUI accepts would be
+    # the more confusing of the two.
     try:
-        manifest = read_manifest(args.dataset)
+        manifest, ours = dataset_meta(args.dataset)
     except (FileNotFoundError, ValueError) as exc:
         print(f"{exc}", file=sys.stderr)
         return 2
 
     if args.list:
         print(f"dataset   {manifest['repo_id']}  at {args.dataset}")
+        if not ours:
+            print("  (no export.json -- read from lerobot's meta/info.json; "
+                  "the source-take mapping is unknown)")
         print(f"  {manifest['n_episodes']} episodes / {manifest['n_frames']} frames "
               f"at {manifest['fps']} Hz")
         print(f"  action space  {manifest['action_space']}")
         print(f"  cameras       {', '.join(manifest.get('cameras', ()))}")
         print(f"  task          {manifest.get('task') or '(all)'}")
-        print()
-        print(f"  {'idx':>4}  source take")
-        for index, source in enumerate(manifest.get("episode_ids", ())):
-            print(f"  {index:>4}  {source}")
+        sources = manifest.get("episode_ids", ())
+        if sources:
+            print()
+            print(f"  {'idx':>4}  source take")
+            for index, source in enumerate(sources):
+                print(f"  {index:>4}  {source}")
         return 0
 
     if args.verify:

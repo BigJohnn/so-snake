@@ -679,7 +679,7 @@ def _has_manifest(dataset_path: Path) -> bool:
 def _lerobot_meta(dataset_path: Path) -> dict[str, Any]:
     """What lerobot's own `info.json` says about a dataset.
 
-    A fallback for `_dataset_meta`: fps and feature shapes are enough to make
+    A fallback for `dataset_meta`: fps and feature shapes are enough to make
     a replayable `Episode`, and they are exactly what lerobot itself uses when
     reading the dataset. Without this fallback a dataset that lost its
     manifest (legacy export, foreign tool) would be unreadable to us even
@@ -704,23 +704,57 @@ def _lerobot_meta(dataset_path: Path) -> dict[str, Any]:
         action_space = "delta"
     else:
         action_space = "absolute"
+    # Deliberately the same keys `write_manifest` produces, so that everything
+    # downstream can read one shape without asking which kind it got. Two
+    # near-identical dicts under one name is how a UI ends up reading a field
+    # that exists on one of them: the episode picker took `n_episodes` from
+    # here and got `None`, so a dataset without our manifest showed zero
+    # episodes and could not be replayed at all.
+    #
+    # No `root`. Where a dataset lives is a property of where it was found, not
+    # of its metadata, and baking a path into either would be wrong the moment
+    # the directory moved. Callers already have the path -- they passed it in.
     return {
         # The repo_id is what lerobot writes into the parquet filenames; when
         # our manifest is missing, the directory name is the only handle we
         # have, and that is what an operator would have called it.
         "repo_id": Path(dataset_path).name,
-        "root": str(dataset_path),
         "task": None,
         "fps": int(info["fps"]),
         "action_space": action_space,
+        "cameras": [
+            key.removeprefix("observation.images.")
+            for key in info.get("features", {})
+            if key.startswith("observation.images.")
+        ],
+        "resolution": _lerobot_resolution(info),
+        "n_episodes": int(info.get("total_episodes", 0)),
+        "n_frames": int(info.get("total_frames", 0)),
+        "cancelled": False,
         # `episode_ids` is the source mapping; without our manifest there is
         # no source mapping, and downstream code must skip the source-fidelity
         # branch (see `verify`).
         "episode_ids": [],
+        "episode_root": "",
     }
 
 
-def _dataset_meta(dataset_path: Path) -> tuple[dict[str, Any], bool]:
+def _lerobot_resolution(info: dict[str, Any]) -> list[int]:
+    """`[height, width]` from the first image feature, or `[0, 0]`.
+
+    Shapes are `(h, w, c)` in a LeRobotDataset's feature table, which is the
+    same order `ExportConfig.resolution` uses, so this passes straight through.
+    """
+    for key, feature in info.get("features", {}).items():
+        if not key.startswith("observation.images."):
+            continue
+        shape = list(feature.get("shape", ()))
+        if len(shape) >= 2:
+            return [int(shape[0]), int(shape[1])]
+    return [0, 0]
+
+
+def dataset_meta(dataset_path: Path) -> tuple[dict[str, Any], bool]:
     """The metadata a dataset carries: ours if present, lerobot's if not.
 
     Returns the metadata dict and `True`/`False` for "we wrote this". The
@@ -818,7 +852,7 @@ def verify(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset_path = Path(dataset_path)
-    manifest, ours = _dataset_meta(dataset_path)
+    manifest, ours = dataset_meta(dataset_path)
     report = VerifyReport(
         repo_id=str(manifest["repo_id"]),
         dataset_path=dataset_path,
@@ -1221,7 +1255,7 @@ def episode_from_dataset(
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset_path = Path(dataset_path)
-    meta, ours = _dataset_meta(dataset_path)
+    meta, ours = dataset_meta(dataset_path)
     fps = int(meta["fps"])
     action_space = str(meta["action_space"])
 

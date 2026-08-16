@@ -297,7 +297,11 @@ function DatasetDetail({
   const replay = async () => {
     if (!manifest) return;
     const body: DatasetReplayBody = {
-      dataset: manifest.root,
+      // `meta.path`, which the gateway put there, and not anything off the
+      // manifest: `export.json` records what the dataset was built *from*
+      // (`episode_root`), never where it itself lives. The same value the
+      // verify button sends.
+      dataset: meta.path,
       episode_index: episodeIndex,
       ...rigBody(rig),
       speed,

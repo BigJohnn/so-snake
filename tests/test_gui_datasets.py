@@ -44,8 +44,11 @@ def _write_dataset(
     if repo_id is None:
         return path
     manifest = {
+        # Exactly the keys `write_manifest` produces. No `root`: a fixture that
+        # invents a field is how the frontend type came to declare one that
+        # nothing sent, which read as `undefined` and resolved to the dataset
+        # root at the far end.
         "repo_id": repo_id,
-        "root": str(path),
         "task": task,
         "fps": fps,
         "action_space": action_space,
@@ -183,9 +186,15 @@ def test_dataset_verdict_is_marked_stale_when_files_change(tmp_path, config):
     dataset_root = tmp_path / "lerobot"
     dataset_root.mkdir()
     path = _write_dataset(dataset_root, "ours", repo_id="so_snake/pick")
+    from so_snake.gui.exporter import VERDICT_VERSION
+
     (path / "verify.json").write_text(
         json.dumps(
             {
+                # This version, so what is under test is staleness and not the
+                # schema check -- they are different reasons to distrust a
+                # cached verdict and each has its own test.
+                "version": VERDICT_VERSION,
                 "verified_at": time.time() - 100,
                 "verified_mtime": 0.0,  # older than the dataset -> stale
                 "ok": True,
@@ -357,3 +366,106 @@ def test_start_verify_refuses_while_another_job_is_running(tmp_path, config):
 
     release.set()
     exporter._thread.join(timeout=5.0)
+
+
+def test_a_verdict_from_a_different_schema_is_discarded(tmp_path, config):
+    """A cached verdict is an answer computed by a particular version of `verify`.
+
+    When that code changes the old answer is not merely missing a field -- it is
+    a claim made by checks that no longer exist in the form they ran. This
+    already bit once: `skipped` was added to the report, and verdicts written
+    before it lacked the field that separates OK from PARTIAL, so an old file
+    would have shown a clean green badge for a check that never ran.
+    """
+    from so_snake.gui.exporter import VERDICT_VERSION, Exporter
+
+    dataset_root = tmp_path / "lerobot"
+    dataset_root.mkdir()
+    path = _write_dataset(dataset_root, "ours", repo_id="so_snake/pick")
+    (path / "verify.json").write_text(
+        json.dumps({"version": VERDICT_VERSION + 1, "ok": True, "issues": []}),
+        encoding="utf-8",
+    )
+
+    exporter = Exporter(EpisodeStore(tmp_path / "episodes"), config, dataset_root=dataset_root)
+    [entry] = exporter.datasets()["datasets"]
+    # Not verified by the code now running, which is the same thing to the
+    # operator as never verified -- and honest, unlike a green badge.
+    assert entry["verdict"] is None
+
+
+def test_the_dataset_root_is_not_itself_a_dataset(tmp_path, config):
+    """The bug behind "meta/info.json is missing" pointing at the root.
+
+    `Path("")` and `Path(".")` both join to the root, so a request that omitted
+    the dataset name -- which is what an undefined field serialises to, since
+    JSON drops the key entirely -- used to resolve to the container and have it
+    opened as a dataset. The error then surfaced three layers down as lerobot
+    metadata missing from `data/lerobot`, which is true and explains nothing.
+    """
+    from so_snake.gui.exporter import Exporter
+
+    dataset_root = tmp_path / "lerobot"
+    dataset_root.mkdir()
+    _write_dataset(dataset_root, "ours", repo_id="so_snake/pick")
+    exporter = Exporter(EpisodeStore(tmp_path / "episodes"), config, dataset_root=dataset_root)
+
+    for missing in ("", "   ", ".", "/"):
+        with pytest.raises(ValueError, match="no dataset was named"):
+            exporter.resolve(missing)
+
+    with pytest.raises(ValueError, match="is the dataset root"):
+        exporter.resolve(str(dataset_root))
+
+    # And the normal case still works, by name and by absolute path.
+    assert exporter.resolve("ours") == (dataset_root / "ours").resolve()
+    assert exporter.resolve(str(dataset_root / "ours")) == (dataset_root / "ours").resolve()
+
+
+def test_a_foreign_dataset_reports_its_episode_count(tmp_path, config):
+    """The episode picker reads `n_episodes`; without it replay is unreachable.
+
+    A dataset with no `export.json` gets a manifest synthesised from lerobot's
+    `info.json`. That synthesised dict must have the *same keys* as the real
+    one, or the UI reads a field that exists on only one of them -- which is
+    what happened: `n_episodes` was absent, the picker showed zero episodes,
+    and a foreign dataset could not be replayed at all.
+    """
+    from so_snake.data.export import dataset_meta
+    from so_snake.gui.exporter import Exporter
+
+    dataset_root = tmp_path / "lerobot"
+    dataset_root.mkdir()
+    foreign = dataset_root / "foreign"
+    (foreign / "meta").mkdir(parents=True)
+    (foreign / "meta" / "info.json").write_text(
+        json.dumps(
+            {
+                "fps": 26,
+                "total_episodes": 10,
+                "total_frames": 4221,
+                "features": {
+                    "action": {"names": ["dx", "dy", "dz", "dpitch", "droll", "gripper"]},
+                    "observation.images.wrist": {"shape": [240, 320, 3]},
+                    "observation.images.third_person": {"shape": [240, 320, 3]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    synthesised, ours = dataset_meta(foreign)
+    assert not ours
+    assert synthesised["n_episodes"] > 0, "the picker would show zero episodes"
+
+    ours_path = _write_dataset(dataset_root, "ours", repo_id="so_snake/pick")
+    real, is_ours = dataset_meta(ours_path)
+    assert is_ours
+    # One shape, so nothing downstream has to ask which kind it got.
+    assert sorted(synthesised) == sorted(real)
+    assert "root" not in real, "where a dataset lives is not part of its metadata"
+
+    exporter = Exporter(EpisodeStore(tmp_path / "episodes"), config, dataset_root=dataset_root)
+    by_name = {d["name"]: d for d in exporter.datasets()["datasets"]}
+    assert by_name["foreign"]["manifest"]["n_episodes"] > 0
+    assert by_name["foreign"]["ours"] is False

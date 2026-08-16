@@ -466,7 +466,15 @@ export interface DatasetMeta {
  *  dataset episode `i` -- the only place that mapping lives. */
 export interface DatasetManifest {
   repo_id: string;
-  root: string;
+  // No `root` here. This mirrors `export.json` exactly, and that file records
+  // what the dataset was built *from* (`episode_root`), never where it lives --
+  // a path baked into a file would be wrong the moment the directory moved.
+  // Where a dataset lives is `DatasetMeta.path`, which the gateway fills in
+  // from the directory it actually found. A `root` field was declared here
+  // once; nothing produced it, so it typechecked and read `undefined` at
+  // runtime, the key dropped out of the JSON body, and the gateway fell back
+  // to "" -- which resolved to the dataset *root* and reported the container
+  // as a broken dataset.
   task: string | null;
   fps: number;
   action_space: string;

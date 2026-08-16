@@ -27,7 +27,7 @@ from so_snake.config import SoSnakeConfig
 from so_snake.data import EpisodeStore
 from so_snake.data.export import (
     ExportConfig,
-    _dataset_meta,
+    dataset_meta,
     _summarise_existing,
     episode_from_dataset,
     export,
@@ -154,13 +154,13 @@ def _make_real_export(
 # --------------------------------------------------- the helper itself
 
 
-def test_dataset_meta_uses_manifest_when_present(tmp_path, config):
+def testdataset_meta_uses_manifest_when_present(tmp_path, config):
     """`ours=True` when our `export.json` is sitting next to the dataset."""
     ep = tmp_path / "episodes"
     ds_root = tmp_path / "lerobot"
     path = _make_real_export(ep, ds_root, config, name="ours")
 
-    meta, ours = _dataset_meta(path)
+    meta, ours = dataset_meta(path)
     assert ours is True
     assert meta["repo_id"] == "so_snake/ours"
     # The fps is whatever the loop actually ran at (30 here, because the
@@ -171,7 +171,7 @@ def test_dataset_meta_uses_manifest_when_present(tmp_path, config):
     assert meta["episode_ids"]  # non-empty: our manifest records sources
 
 
-def test_dataset_meta_falls_back_to_lerobot_info_json(tmp_path, config):
+def testdataset_meta_falls_back_to_lerobot_info_json(tmp_path, config):
     """A foreign / legacy dataset still gets fps and action_space from lerobot.
 
     `ours=False` and `episode_ids=[]`: source mapping is unknown. The action
@@ -195,7 +195,7 @@ def test_dataset_meta_falls_back_to_lerobot_info_json(tmp_path, config):
         encoding="utf-8",
     )
 
-    meta, ours = _dataset_meta(path)
+    meta, ours = dataset_meta(path)
     assert ours is False
     assert meta["fps"] == 26
     assert meta["action_space"] == "delta"
