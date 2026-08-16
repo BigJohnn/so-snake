@@ -51,6 +51,7 @@ from ..m3_safety.ik5d import TaskIK5D
 from ..m3_safety.task_pose import SO100TaskPose, wrap_to_pi
 from ..m4_execution.backends import RobotBackend
 from ..m4_execution.motion import move_to_joints
+from ..pacing import RateKeeper
 from .episode import Episode
 
 REPLAY_MODES = ("joint", "task")
@@ -387,10 +388,19 @@ class EpisodeReplayer:
                 "replay went ahead and the first frames close the rest"
             )
 
-        recorded_hz = episode.meta.control_hz or self.config.teleop.control_hz
+        # The rate the take *ran* at, not the one it was configured for. Those
+        # differed by 15% for everything recorded before the pacing fix (see
+        # `so_snake.pacing`): configured 30 Hz, achieved 26. Replaying such an
+        # episode at its configured rate plays it back 15% fast, which on this
+        # arm is a real difference -- the tracking lag is the largest term in
+        # the motion, and it does not scale with playback speed.
+        recorded_hz = episode.playback_hz or self.config.teleop.control_hz
         period = 1.0 / (recorded_hz * self.replay.speed)
         rate_limit = self.replay.rate_limit_deg_s(self.config)
         max_step_deg = rate_limit * period
+        keeper = RateKeeper(
+            recorded_hz * self.replay.speed, enabled=self.replay.realtime
+        )
 
         clearance_probe = getattr(self.backend, "command_robot_mesh_min_z_deg", None)
         if not (self.replay.check_clearance and callable(clearance_probe)):
@@ -402,7 +412,6 @@ class EpisodeReplayer:
         t_prev = t_start
 
         for i in range(n):
-            t_loop = time.perf_counter()
             if should_continue is not None and not should_continue():
                 report.aborted_reason = "stopped by the operator"
                 break
@@ -466,10 +475,7 @@ class EpisodeReplayer:
                 on_step(step)
             t_prev = now
 
-            if self.replay.realtime:
-                slack = period - (time.perf_counter() - t_loop)
-                if slack > 0:
-                    time.sleep(slack)
+            keeper.wait()
         else:
             report.completed = True
 

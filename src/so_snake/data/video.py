@@ -53,7 +53,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
-from dataclasses import dataclass, field
+from dataclasses import astuple, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -201,20 +201,79 @@ def probe_encoder(codec: str, width: int = 640, height: int = 480,
     return ""
 
 
+# Answers already paid for, keyed by what the answer depends on. Verifying an
+# encoder means really encoding with it, which at 1920x1080 measured **678 ms**
+# on this bench -- and `select_encoder` used to run on every press of record,
+# inside the session lock, which is where the control loop's telemetry write
+# also waits. The result was a reliable ~700 ms stall on the first frame of
+# every take, big enough on its own to pull a 292-step take's average rate from
+# 30.1 Hz down to 28.2.
+#
+# The answer cannot change while the process runs: it is a property of this
+# machine's codecs and core count at a given frame size. So it is computed once.
+_ENCODER_CACHE: dict[tuple, "EncoderChoice"] = {}
+_ENCODER_CACHE_LOCK = threading.Lock()
+# One in-flight probe per key. The GUI warms the cache on a side thread at
+# session start; if the operator presses record before that finishes, this makes
+# the second caller wait for the first one's answer instead of starting a second
+# 700 ms probe of the same thing. Keyed, so warming 1080p never blocks a lookup
+# of an already-known 480p.
+_ENCODER_PROBE_LOCKS: dict[tuple, threading.Lock] = {}
+
+
 def select_encoder(
     config: VideoConfig | None = None,
     *,
     width: int = 640,
     height: int = 480,
     cpu_count: int | None = None,
+    use_cache: bool = True,
 ) -> EncoderChoice:
     """Pick an encoder for this machine, verifying it before returning it.
+
+    Verified by encoding, which is slow (see `_ENCODER_CACHE`), so the result is
+    memoised per (config, size, core count). `use_cache=False` forces the probe,
+    for a test that wants to see it fail.
 
     Raises if nothing works: recording camera frames with no encoder is not
     something to paper over, and the caller can still record an episode without
     video by not asking for any.
     """
     config = config or VideoConfig()
+    cores_key = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
+    # The whole config, not a hand-picked subset: every field of it feeds the
+    # probe one way or another, and a key that listed some of them would go
+    # quietly stale the first time a new one was added.
+    key = (repr(astuple(config)), int(width), int(height), int(cores_key))
+    if not use_cache:
+        return _select_encoder_uncached(config, width, height, cpu_count)
+
+    with _ENCODER_CACHE_LOCK:
+        cached = _ENCODER_CACHE.get(key)
+        if cached is not None:
+            return cached
+        probe_lock = _ENCODER_PROBE_LOCKS.setdefault(key, threading.Lock())
+
+    # Outside the cache lock, so a probe for one frame size never blocks a
+    # lookup of another; inside the per-key lock, so two callers wanting the
+    # same answer pay for it once.
+    with probe_lock:
+        with _ENCODER_CACHE_LOCK:
+            cached = _ENCODER_CACHE.get(key)
+        if cached is not None:
+            return cached
+        choice = _select_encoder_uncached(config, width, height, cpu_count)
+        with _ENCODER_CACHE_LOCK:
+            _ENCODER_CACHE[key] = choice
+        return choice
+
+
+def _select_encoder_uncached(
+    config: VideoConfig,
+    width: int,
+    height: int,
+    cpu_count: int | None,
+) -> EncoderChoice:
     cores = cpu_count if cpu_count is not None else (os.cpu_count() or 1)
 
     if config.codec != "auto":

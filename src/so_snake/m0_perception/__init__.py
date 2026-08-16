@@ -7,6 +7,7 @@ from .cameras import (
     cameras_import_error,
     frame_for_preview,
     list_devices,
+    scan_devices,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "cameras_import_error",
     "frame_for_preview",
     "list_devices",
+    "scan_devices",
 ]

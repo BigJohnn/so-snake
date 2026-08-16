@@ -1,15 +1,19 @@
 import type {
+  ActionSpace,
   AppConfig,
   BackendKind,
-  CameraDevice,
+  CameraScan,
   EpisodeDetail,
   EpisodeMeta,
+  ExportPlan,
+  ExportProgress,
   PortScan,
   ReplayMode,
   Roadmap,
   SeriesRow,
   Snapshot,
-  SourceKind
+  SourceKind,
+  TaskSummary
 } from "./types";
 
 // The gateway answers failures with `{"error": "..."}` and a 4xx/5xx, so the
@@ -79,9 +83,10 @@ export const api = {
     request<{ series: SeriesRow[] }>(`/api/series?limit=${limit}`).then((r) => r.series),
 
   // Slow (opens every device), so this is called on demand from the rig
-  // controls and never polled.
-  cameras: () =>
-    request<{ devices: CameraDevice[]; roles: string[] }>("/api/cameras").then((r) => r.devices),
+  // controls and never polled. The diagnostics come back with it: an empty or
+  // short list has several very different causes, and the operator cannot tell
+  // them apart from the list alone.
+  cameras: () => request<CameraScan>("/api/cameras"),
 
   // Cheap, unlike the camera scan: this reads the OS device list and opens
   // nothing, so it is safe even while the arm is connected.
@@ -118,8 +123,38 @@ export const api = {
   decideLastTake: (keep: boolean) => post<Snapshot>("/api/record/decide", { keep }),
 
   startReplay: (body: RigBody & { episode_id: string; mode: ReplayMode; speed: number }) =>
-    post<Snapshot>("/api/replay/start", body)
+    post<Snapshot>("/api/replay/start", body),
+
+  // ---------------------------------------------------------------- export
+
+  /** Task labels in the store, with what each would contribute to a dataset. */
+  exportTasks: () =>
+    request<{ tasks: TaskSummary[]; dataset_root: string }>("/api/export/tasks"),
+
+  /** The dry run: screens the selection and reports, writing nothing. Cheap
+   *  enough to be synchronous, which is the point -- a pre-flight the operator
+   *  has to wait on a poll for is a pre-flight they will skip. */
+  exportPlan: (body: ExportBody) => post<ExportPlan>("/api/export/plan", body),
+
+  /** Starts the background job. Refused while the arm is being driven. */
+  startExport: (body: ExportBody) => post<ExportProgress>("/api/export/start", body),
+  exportStatus: () => request<ExportProgress>("/api/export/status"),
+  cancelExport: () => post<ExportProgress>("/api/export/cancel")
 };
+
+export interface ExportBody {
+  repo_id: string;
+  task?: string | null;
+  episode_ids?: string[];
+  action_space?: ActionSpace;
+  cameras?: string[];
+  resolution?: [number, number];
+  fps?: number | null;
+  include_aborted?: boolean;
+  /** Read the dataset back after writing and check it replays. Defaults true
+   *  server-side, and there is no good reason to turn it off. */
+  verify?: boolean;
+}
 
 export const episodeVideoUrl = (id: string, camera: string) =>
   `/api/episode/video?id=${encodeURIComponent(id)}&camera=${encodeURIComponent(camera)}`;

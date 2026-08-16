@@ -20,7 +20,7 @@ dataset's action space depends on all of it.
 | teleop mapping | clutch-relative orientation, anchored on measured joints |
 | orientation control | position-anchored chart projection onto `span{a(p), u(p,pitch,roll)}`; `J_w · null(J_v)` retained as an independent diagnostic |
 | internal target | absolute `(x, y, z, pitch, roll)` |
-| policy action | `Δ(x, y, z, pitch, roll)` + gripper |
+| policy action | `Δ(x, y, z, pitch, roll)` + gripper — anchored on the *reached* pose, see [`act_baseline.md`](act_baseline.md) |
 | IK | true 5D task IK — no yaw objective, no orientation weight to tune |
 | logging | full 6D FK pose + raw IMU + projected action + executed joints |
 

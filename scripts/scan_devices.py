@@ -39,6 +39,7 @@ from so_snake.devices import (
     scan_cameras,
 )
 from so_snake.m0_perception import CAMERA_ROLES
+from so_snake.m0_perception.cameras import LOW_DETAIL_LAPLACIAN_VAR
 
 DEFAULT_THUMBNAIL_DIR = REPO_ROOT / "data" / "device_scan"
 
@@ -88,6 +89,14 @@ def report_cameras(directory: Path, max_index: int, write_thumbnails: bool) -> N
             path = directory / f"camera_{d.index}.jpg"
             path.write_bytes(base64.b64decode(d.thumbnail.split(",", 1)[1]))
             print(f"      {path}")
+        # Said out loud, per device. A thumbnail with no detail reads as "the
+        # camera did not show up" when it is right there in the list, and
+        # without this line the only evidence is an image to squint at. Not a
+        # fault: a wrist camera focused at gripper distance belongs here.
+        if d.note:
+            print(f"      NOTE     {d.note}")
+            print(f"               sharpness {d.sharpness} (detail shows above "
+                  f"{LOW_DETAIL_LAPLACIAN_VAR:g}), contrast {d.contrast}")
         print(f"      --camera {CAMERA_ROLES[0]}={d.device}   (or {CAMERA_ROLES[1]}={d.device})")
 
     if write_thumbnails:

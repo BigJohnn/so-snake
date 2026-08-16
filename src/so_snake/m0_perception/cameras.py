@@ -112,6 +112,92 @@ def _thumbnail(frame_bgr: np.ndarray, width: int = 192) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.tobytes()).decode("ascii")
 
 
+# Below this, a frame carries too little detail to tell one camera from another
+# by eye. That is a statement about *identifying* the device during a scan, and
+# emphatically not a statement that anything is wrong with it.
+#
+# The number is the variance of the Laplacian, the standard focus measure.
+# Across repeated scans of the five devices on this bench:
+#
+#     third-person DECXIN   120-128   aimed at the workspace, sharp
+#     OBS virtual camera         74   a rendered logo
+#     built-in FaceTime       10-15   in focus, pointed at a plain room
+#     wrist DECXIN           2.2-4.3  near-focused, nothing in front of it
+#     iPhone (locked)           0.0   a black frame forever
+#
+# **The wrist camera reading low is correct behaviour.** Its lens is focused at
+# roughly gripper distance, which is the only distance at which its picture is
+# worth anything -- the policy needs to see the object as the jaws close on it,
+# not the far side of the room. With nothing in front of the gripper it images a
+# blurred background, and that is the lens doing its job. An earlier version of
+# this file called that "badly out of focus" and told the operator to turn the
+# focus ring, which would have broken a correctly set up camera.
+#
+# So this measure gates nothing. It never has: no code path refuses to open,
+# record, or export on account of it. What it does is answer the question the
+# scan exists to answer -- *which thumbnail is which camera* -- because a
+# low-detail thumbnail in a row of five reads as an empty slot, and the operator
+# concludes the camera did not show up when it is right there.
+#
+# The measure is scene-dependent rather than purely optical (a sharp camera
+# aimed at a blank wall scores low too), so no threshold separates the
+# populations perfectly. It does not need to: a false positive costs one
+# unnecessary line of hint text.
+LOW_DETAIL_LAPLACIAN_VAR = 6.0
+
+# Below this the frame is a flat field -- a lens cap, a covered camera, or a
+# device that streams a black frame forever, which is what a locked iPhone
+# offering itself as a Continuity Camera does. Unlike low detail, this one
+# really is "no picture", though it still blocks nothing.
+BLANK_CONTRAST_STD = 6.0
+
+
+def _sharpness(frame_bgr: np.ndarray) -> tuple[float, float]:
+    """`(laplacian variance, contrast std)` for a captured frame.
+
+    Both are computed on the full-resolution frame rather than the thumbnail:
+    downscaling is itself a low-pass filter, so a thumbnail's Laplacian would
+    report every camera as softer than it is and the threshold would stop
+    separating them.
+    """
+    import cv2
+
+    grey = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(grey, cv2.CV_64F).var()), float(grey.std())
+
+
+def _picture_quality(frame_bgr: np.ndarray) -> dict[str, Any]:
+    """Measures of the frame, and a note if it is hard to identify by eye.
+
+    The note is an aid to picking the right device out of a row of thumbnails.
+    It is never a verdict on the camera: a scan cannot know which role a device
+    is about to be given, and for the wrist role a low-detail picture at rest is
+    the expected and correct thing to see.
+    """
+    sharpness, contrast = _sharpness(frame_bgr)
+    if contrast < BLANK_CONTRAST_STD:
+        note = (
+            "no picture -- a flat frame with no contrast at all. The lens is "
+            "covered, or the device streams a fixed frame (a locked iPhone "
+            "offering itself as a Continuity Camera does this)"
+        )
+    elif sharpness < LOW_DETAIL_LAPLACIAN_VAR:
+        note = (
+            "little detail at this distance, so it is hard to tell apart from "
+            "another camera by its picture. This is normal and correct for a "
+            "wrist camera at rest -- it is focused at gripper distance and only "
+            "needs to be sharp there. To identify it, hold something a few "
+            "centimetres in front of the lens and scan again"
+        )
+    else:
+        note = ""
+    return {
+        "sharpness": round(sharpness, 2),
+        "contrast": round(contrast, 2),
+        "note": note,
+    }
+
+
 def _linux_camera_names() -> dict[int, str]:
     """`/dev/videoN` -> friendly name, from sysfs. Best effort."""
     from pathlib import Path
@@ -161,8 +247,8 @@ def _linux_stable_paths() -> dict[int, str]:
     return paths
 
 
-def list_devices(max_index: int = 8, thumbnails: bool = True) -> list[dict[str, Any]]:
-    """Enumerate cameras that actually deliver a frame, with a picture of each.
+def scan_devices(max_index: int = 16, thumbnails: bool = True) -> dict[str, Any]:
+    """Enumerate cameras and explain what happened to the rejected candidates.
 
     `isOpened()` is not the test -- on macOS a Continuity Camera opens happily
     and then never produces an image -- so each candidate must hand over a frame
@@ -192,9 +278,26 @@ def list_devices(max_index: int = 8, thumbnails: bool = True) -> list[dict[str, 
     permission is the first thing to check: a denied process sees no devices
     rather than an error.
     """
+    diagnostics: dict[str, Any] = {
+        "platform": platform.system(),
+        "max_index": int(max_index),
+        "attempted": 0,
+        "opened": 0,
+        "readable": 0,
+        "failures": [],
+        # Devices whose picture carries too little detail to identify them by.
+        # They are still in `devices` and nothing refuses them; this exists so
+        # the UI can point at the thumbnail that looks like an empty slot and
+        # say which camera it is, instead of the operator concluding it did not
+        # show up. A wrist camera at rest lands here by design.
+        "hard_to_identify": [],
+        "permission_hint": "",
+    }
+
     error = cameras_import_error()
     if error:
-        return []
+        diagnostics["permission_hint"] = f"camera dependencies are unavailable: {error}"
+        return {"devices": [], "diagnostics": diagnostics}
 
     import cv2
 
@@ -204,10 +307,13 @@ def list_devices(max_index: int = 8, thumbnails: bool = True) -> list[dict[str, 
 
     devices: list[dict[str, Any]] = []
     for index in range(max_index):
+        diagnostics["attempted"] += 1
         capture = cv2.VideoCapture(index)
         try:
             if not capture.isOpened():
+                diagnostics["failures"].append({"index": index, "reason": "did not open"})
                 continue
+            diagnostics["opened"] += 1
             ok, frame = False, None
             # A few frames in: the first one out of a UVC camera is often the
             # sensor's warm-up, and a black or half-exposed thumbnail is no use
@@ -217,8 +323,15 @@ def list_devices(max_index: int = 8, thumbnails: bool = True) -> list[dict[str, 
             if not ok or frame is None:
                 # Opens but does not stream. An iPhone offering itself as a
                 # Continuity Camera does exactly this when it is locked.
+                diagnostics["failures"].append({"index": index, "reason": "opened but produced no frame"})
                 continue
+            diagnostics["readable"] += 1
             height, width = frame.shape[:2]
+            quality = _picture_quality(frame)
+            if quality["note"]:
+                diagnostics["hard_to_identify"].append(
+                    {"index": index, "reason": quality["note"]}
+                )
             # `device` is what gets stored in the rig and the episode: the
             # stable by-id path where the platform offers one, and the bare
             # index -- which is only meaningful until something is replugged --
@@ -242,11 +355,27 @@ def list_devices(max_index: int = 8, thumbnails: bool = True) -> list[dict[str, 
                     "width": int(width),
                     "height": int(height),
                     "thumbnail": _thumbnail(frame) if thumbnails else "",
+                    # `sharpness`/`contrast`/`note`. Advisory only -- nothing
+                    # anywhere refuses a device on account of them, because a
+                    # scan cannot know which role a camera is about to be given
+                    # and a near-focused wrist camera is supposed to look flat.
+                    **quality,
                 }
             )
         finally:
             capture.release()
-    return devices
+
+    if not devices and platform.system() == "Darwin":
+        diagnostics["permission_hint"] = (
+            "macOS did not allow this process to read any camera. Grant Camera "
+            "permission to the terminal/app that starts scripts/run_gui.sh, then scan again."
+        )
+    return {"devices": devices, "diagnostics": diagnostics}
+
+
+def list_devices(max_index: int = 16, thumbnails: bool = True) -> list[dict[str, Any]]:
+    """Only the devices, for callers that do not need scan diagnostics."""
+    return list(scan_devices(max_index=max_index, thumbnails=thumbnails)["devices"])
 
 
 # ------------------------------------------------------------------ capture

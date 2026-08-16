@@ -116,7 +116,68 @@ export function SeriesPlot({
     return { lo, hi };
   }, [series, reference, yMin, yMax]);
 
-  if (!x.length || !domain) {
+  /* Everything whose cost is proportional to the number of samples, computed
+   * once per data change rather than once per render.
+   *
+   * The cursor moves at video frame rate -- the dataset page drives it from
+   * `requestAnimationFrame` so the frame counter advances one frame at a time
+   * instead of in the ~8-frame jumps `timeupdate` produces. That is 30 renders
+   * a second of five plots, and rebuilding a 1200-point path string per series
+   * on each of them is several milliseconds of string building competing with
+   * two 1080p AV1 decodes. Memoised, a cursor move rebuilds one `<line>`.
+   *
+   * Deliberately above the empty-data early return: hooks cannot live after it.
+   */
+  const geometry = useMemo(() => {
+    if (!x.length || !domain) return null;
+
+    const plotW = Math.max(width - PAD.left - PAD.right, 10);
+    const plotH = Math.max(height - PAD.top - PAD.bottom, 10);
+    const n = x.length;
+    const px = (i: number) => PAD.left + (n <= 1 ? plotW / 2 : (plotW * i) / (n - 1));
+    const py = (v: number) => PAD.top + plotH * (1 - (v - domain.lo) / (domain.hi - domain.lo));
+
+    const path = (values: (number | null)[]) => {
+      let d = "";
+      let pen = false;
+      values.forEach((v, i) => {
+        if (v === null || !Number.isFinite(v)) {
+          pen = false;
+          return;
+        }
+        d += `${pen ? "L" : "M"}${px(i).toFixed(1)},${py(v).toFixed(1)}`;
+        pen = true;
+      });
+      return d;
+    };
+
+    const bandRects = (values: boolean[]) => {
+      const rects: { x: number; w: number }[] = [];
+      let start: number | null = null;
+      values.forEach((on, i) => {
+        if (on && start === null) start = i;
+        if ((!on || i === values.length - 1) && start !== null) {
+          const end = on ? i : i - 1;
+          rects.push({ x: px(start), w: Math.max(px(end) - px(start), 1) });
+          start = null;
+        }
+      });
+      return rects;
+    };
+
+    return {
+      plotW,
+      plotH,
+      n,
+      px,
+      py,
+      paths: series.map((s) => path(s.values)),
+      rects: (bands ?? []).map((band) => bandRects(band.values)),
+      ticks: niceTicks(domain.lo, domain.hi, 3)
+    };
+  }, [x, series, bands, width, height, domain]);
+
+  if (!x.length || !domain || !geometry) {
     return (
       <svg ref={measure} className="plot" height={height} role="img" aria-label={placeholder}>
         <text x="50%" y="50%" textAnchor="middle" fill="#5c6775" fontSize="11" fontFamily="var(--mono)">
@@ -126,41 +187,7 @@ export function SeriesPlot({
     );
   }
 
-  const plotW = Math.max(width - PAD.left - PAD.right, 10);
-  const plotH = Math.max(height - PAD.top - PAD.bottom, 10);
-  const n = x.length;
-  const px = (i: number) => PAD.left + (n <= 1 ? plotW / 2 : (plotW * i) / (n - 1));
-  const py = (v: number) => PAD.top + plotH * (1 - (v - domain.lo) / (domain.hi - domain.lo));
-
-  const path = (values: (number | null)[]) => {
-    let d = "";
-    let pen = false;
-    values.forEach((v, i) => {
-      if (v === null || !Number.isFinite(v)) {
-        pen = false;
-        return;
-      }
-      d += `${pen ? "L" : "M"}${px(i).toFixed(1)},${py(v).toFixed(1)}`;
-      pen = true;
-    });
-    return d;
-  };
-
-  const bandRects = (values: boolean[]) => {
-    const rects: { x: number; w: number }[] = [];
-    let start: number | null = null;
-    values.forEach((on, i) => {
-      if (on && start === null) start = i;
-      if ((!on || i === values.length - 1) && start !== null) {
-        const end = on ? i : i - 1;
-        rects.push({ x: px(start), w: Math.max(px(end) - px(start), 1) });
-        start = null;
-      }
-    });
-    return rects;
-  };
-
-  const ticks = niceTicks(domain.lo, domain.hi, 3);
+  const { plotW, plotH, n, px, py, ticks } = geometry;
   const multi = series.length > 1;
 
   return (
@@ -214,8 +241,8 @@ export function SeriesPlot({
         }
         style={onScrub ? { cursor: "pointer" } : undefined}
       >
-        {(bands ?? []).flatMap((band, bi) =>
-          bandRects(band.values).map((rect, ri) => (
+        {geometry.rects.flatMap((band, bi) =>
+          band.map((rect, ri) => (
             <rect
               key={`b${bi}-${ri}`}
               x={rect.x}
@@ -264,7 +291,7 @@ export function SeriesPlot({
         {series.map((s, i) => (
           <path
             key={s.label}
-            d={path(s.values)}
+            d={geometry.paths[i]}
             fill="none"
             stroke={s.color ?? SERIES_COLORS[i % SERIES_COLORS.length]}
             strokeWidth={2}

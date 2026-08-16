@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react";
 import { api, ApiError, type RigBody } from "../api";
 import { Banner, Field, Segmented } from "./ui";
-import type { AppConfig, BackendKind, CameraDevice, CameraRole, PortScan, SourceKind } from "../types";
+import type {
+  AppConfig,
+  BackendKind,
+  CameraDevice,
+  CameraRole,
+  CameraScan,
+  PortScan,
+  SourceKind
+} from "../types";
 
 export interface RigState {
   backend: BackendKind;
@@ -146,6 +154,40 @@ const ROLE_LABELS: Record<CameraRole, string> = {
   wrist: "腕部"
 };
 
+const HIDDEN_CAMERAS_KEY = "so-snake.hidden-cameras";
+
+/** Hidden device keys, plus the scan they were chosen against. */
+interface HiddenCameras {
+  keys: string[];
+  fingerprint: string;
+}
+
+/** What the set of attached cameras looks like, for deciding whether a stored
+ *  hide list still refers to the same devices. Resolution is in it because on
+ *  macOS it is the only other thing that distinguishes one index from another. */
+function cameraFingerprint(devices: CameraDevice[]): string {
+  return devices
+    .map((d) => `${d.device}:${d.width}x${d.height}`)
+    .sort()
+    .join("|");
+}
+
+function loadHidden(): HiddenCameras {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_CAMERAS_KEY) ?? "null");
+    // The old shape was a bare array of keys with no fingerprint. Treat it as
+    // stale rather than trusting it: it was stored under exactly the assumption
+    // that turned out not to hold.
+    if (Array.isArray(raw)) return { keys: [], fingerprint: "" };
+    if (raw && Array.isArray(raw.keys)) {
+      return { keys: raw.keys.map(String), fingerprint: String(raw.fingerprint ?? "") };
+    }
+  } catch {
+    /* fall through */
+  }
+  return { keys: [], fingerprint: "" };
+}
+
 /** Device pickers for the two camera roles, with an on-demand scan.
  *
  * Scanning is a button rather than something that happens on mount because it
@@ -164,36 +206,51 @@ function CameraPickers({
   config: AppConfig;
   disabled: boolean;
 }) {
-  const [scanned, setScanned] = useState<CameraDevice[] | null>(null);
+  const [scan, setScan] = useState<CameraScan | null>(null);
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState("");
   // Hidden by the operator, remembered per browser. This is the only dependable
   // way to get the built-in webcam and OBS's virtual camera out of the way on
   // macOS: the platform can say which devices are USB, but not which OpenCV
   // index each of them is, so a "USB only" filter would be guessing about
-  // exactly the thing that must not be guessed. Hiding by hand cannot be wrong
-  // -- the operator is looking at the picture while they do it.
-  const [hidden, setHidden] = useState<string[]>(() => {
-    try {
-      return JSON.parse(localStorage.getItem("so-snake.hidden-cameras") ?? "[]");
-    } catch {
-      return [];
-    }
-  });
+  // exactly the thing that must not be guessed.
+  //
+  // The key is `device`, which on macOS is the bare index -- and the index is
+  // not stable, which makes the filter unsafe in a way that is completely
+  // silent. Hide index 2 because it is the built-in webcam, replug, and index 2
+  // is now the wrist camera: it vanishes from the scan and the operator is
+  // looking for a camera that the list is deliberately not showing them. So the
+  // hidden set is stored with a fingerprint of the scan it was made against,
+  // and is dropped the moment the shape of the device list changes. A filter
+  // that forgets too eagerly costs one more click; one that forgets too late
+  // costs an afternoon.
+  const [hidden, setHidden] = useState<HiddenCameras>(loadHidden);
   const [showHidden, setShowHidden] = useState(false);
 
+  const fingerprint = scan ? cameraFingerprint(scan.devices) : "";
+  // Stale against this scan: honour nothing, and say so.
+  const hiddenStale = Boolean(
+    fingerprint && hidden.fingerprint && hidden.fingerprint !== fingerprint
+  );
+  const hiddenKeys = hiddenStale ? [] : hidden.keys;
+
   const hide = (key: string, off: boolean) => {
-    const next = off ? [...new Set([...hidden, key])] : hidden.filter((k) => k !== key);
+    const keys = off
+      ? [...new Set([...hiddenKeys, key])]
+      : hiddenKeys.filter((k) => k !== key);
+    const next: HiddenCameras = { keys, fingerprint };
     setHidden(next);
     try {
-      localStorage.setItem("so-snake.hidden-cameras", JSON.stringify(next));
+      localStorage.setItem(HIDDEN_CAMERAS_KEY, JSON.stringify(next));
     } catch {
       /* a browser that refuses storage still gets the filter for this session */
     }
   };
 
-  const devices = scanned?.filter((d) => showHidden || !hidden.includes(String(d.device))) ?? null;
+  const scanned = scan?.devices ?? null;
+  const devices = scanned?.filter((d) => showHidden || !hiddenKeys.includes(String(d.device))) ?? null;
   const hiddenCount = (scanned?.length ?? 0) - (devices?.length ?? 0);
+  const diagnostics = scan?.diagnostics;
 
   const availability = config.availability.cameras;
   if (!availability?.available) {
@@ -204,11 +261,11 @@ function CameraPickers({
     );
   }
 
-  const scan = async () => {
+  const runScan = async () => {
     setScanning(true);
     setError("");
     try {
-      setScanned(await api.cameras());
+      setScan(await api.cameras());
     } catch (exc) {
       setError(exc instanceof ApiError ? exc.message : String(exc));
     } finally {
@@ -225,7 +282,7 @@ function CameraPickers({
       hint="按画面认相机,不要按编号 —— macOS 上编号既不对应设备名,也不在重插后保持不变"
     >
       <div className="row">
-        <button className="btn" disabled={disabled || scanning} onClick={() => void scan()}>
+        <button className="btn" disabled={disabled || scanning} onClick={() => void runScan()}>
           {scanning ? "扫描中…" : scanned ? "重新扫描" : "扫描相机"}
         </button>
         {hiddenCount > 0 || showHidden ? (
@@ -236,9 +293,34 @@ function CameraPickers({
       </div>
 
       {error ? <Banner tone="error">{error}</Banner> : null}
+      {hiddenStale ? (
+        <Banner tone="info">
+          相机列表和上次隐藏时不一样了(插拔过),已经取消隐藏 ——
+          macOS 上编号会挪位,再按旧编号隐藏就会藏错相机。
+        </Banner>
+      ) : null}
       {devices !== null && devices.length === 0 && !error ? (
         <Banner tone="warn">
-          没扫到相机。macOS 上先确认终端有摄像头权限(系统设置 → 隐私与安全性 → 摄像头)。
+          {diagnostics?.permission_hint ||
+            "没扫到相机。macOS 上先确认终端有摄像头权限(系统设置 → 隐私与安全性 → 摄像头)。"}
+        </Banner>
+      ) : null}
+      {/* A thumbnail with no detail reads as an empty slot, so the operator
+          concludes the camera is missing when it is right there. Naming it is
+          the whole job here -- it is not a fault report, and nothing is
+          blocked: an "info" tone, not "warn". */}
+      {diagnostics?.hard_to_identify?.length ? (
+        <Banner tone="info">
+          有 {diagnostics.hard_to_identify.length} 个相机画面细节很少,不好按图认
+          —— 它们**在**下面的列表里,能选也能录:
+          <ul className="tight">
+            {diagnostics.hard_to_identify.map((u) => (
+              <li key={u.index}>
+                <span className="mono">#{u.index}</span> {u.reason}
+              </li>
+            ))}
+          </ul>
+          腕部相机对焦在夹爪距离上,面前没东西时本来就是糊的 —— 这是对的,不用去拧镜头。
         </Banner>
       ) : null}
 
@@ -260,18 +342,23 @@ function CameraPickers({
               {devices.map((device) => {
                 const value = String(device.device);
                 const picked = rig.cameras[role] === value;
-                const isHidden = hidden.includes(value);
+                const isHidden = hiddenKeys.includes(value);
                 return (
                   <div className={`camera-choice-wrap${isHidden ? " dimmed" : ""}`} key={device.index}>
                     <button
-                      className={`camera-choice${picked ? " picked" : ""}`}
+                      className={
+                        `camera-choice${picked ? " picked" : ""}` +
+                        (device.note ? " low-detail" : "")
+                      }
                       disabled={disabled}
                       onClick={() => setRole(role, picked ? "" : value)}
                       title={
                         `${device.width}×${device.height}\n${device.device}\n` +
                         (device.stable
                           ? "重插后仍指向同一台相机"
-                          : "编号会随设备增减变化,重插后需重扫")
+                          : "编号会随设备增减变化,重插后需重扫") +
+                        `\n细节 ${device.sharpness} / 对比度 ${device.contrast}` +
+                        (device.note ? `\n\n${device.note}` : "")
                       }
                     >
                       {device.thumbnail ? (
@@ -283,6 +370,10 @@ function CameraPickers({
                         {device.stable ? "🔒" : ""}
                         {device.bus === "usb" ? "USB " : ""}
                         {device.name || device.index}
+                        {/* A neutral mark, not a warning sign: it says "this
+                            picture is hard to read", which for the wrist camera
+                            is the expected state. The old ⚠ read as a fault. */}
+                        {device.note ? " ·" : ""}
                       </span>
                     </button>
                     <button

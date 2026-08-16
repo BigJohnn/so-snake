@@ -118,7 +118,17 @@ export function Segmented<T extends string>({
   );
 }
 
-export function Banner({ tone, children }: { tone: "error" | "warn" | "info"; children: ReactNode }) {
+export function Banner({
+  tone,
+  children
+}: {
+  // "ok" is not decoration. The export's verification is the one place in this
+  // UI where a green result is a claim worth making -- "this dataset reads back
+  // to what was recorded" -- and rendering it in the same grey as an ordinary
+  // note would hide the only sentence the operator is waiting for.
+  tone: "error" | "warn" | "info" | "ok";
+  children: ReactNode;
+}) {
   return <div className={`banner ${tone}`}>{children}</div>;
 }
 

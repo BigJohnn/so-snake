@@ -156,6 +156,35 @@ export interface CameraDevice {
   width: number;
   height: number;
   thumbnail: string;
+  /** Variance of the Laplacian: the standard focus measure. */
+  sharpness: number;
+  /** Greyscale standard deviation. Near zero is a blank or covered lens. */
+  contrast: number;
+  /** Why this camera is hard to tell apart from another by its picture, or "".
+   *  Advisory only -- the device is listed, selectable, and recordable. A wrist
+   *  camera focused at gripper distance reads low here by design. */
+  note: string;
+}
+
+/** Why the scan found what it found. Shown when something is missing, because
+ *  an empty or short list has several very different causes. */
+export interface CameraDiagnostics {
+  platform: string;
+  max_index: number;
+  attempted: number;
+  opened: number;
+  readable: number;
+  failures: { index: number; reason: string }[];
+  /** Present but low on detail. Nothing refuses these; the list exists so the
+   *  UI can name the thumbnail that looks like an empty slot. */
+  hard_to_identify: { index: number; reason: string }[];
+  permission_hint: string;
+}
+
+export interface CameraScan {
+  devices: CameraDevice[];
+  diagnostics: CameraDiagnostics;
+  roles: string[];
 }
 
 /** Which cameras a session asked for, and which of them actually opened. */
@@ -305,4 +334,99 @@ export interface Roadmap {
   groups: { group: string; items: RoadmapItem[] }[];
   counts: Record<string, number>;
   total: number;
+}
+
+// ------------------------------------------------------------------ export
+
+export type ActionSpace = "delta" | "absolute";
+
+/** One task label in the store, and what exporting it would contribute. */
+export interface TaskSummary {
+  task: string;
+  takes: number;
+  steps: number;
+  seconds: number;
+}
+
+/** Why one take was or was not included in an export. */
+export interface ExportEpisodeReport {
+  episode_id: string;
+  task: string;
+  n_steps: number;
+  measured_fps: number;
+  gripper_measured: boolean;
+  included: boolean;
+  reason: string;
+  /** What the loop was configured for when this take was recorded. Below
+   *  `measured_fps` means the loop missed its rate then, which is baked into
+   *  the take — no amount of re-exporting raises it. */
+  configured_hz: number;
+}
+
+export interface ExportReport {
+  fps: number;
+  action_space: string;
+  n_episodes: number;
+  n_frames: number;
+  cancelled: boolean;
+  dataset_path: string;
+  episode_ids: string[];
+  action_stats: Record<string, any>;
+  replay_check: Record<string, any>;
+  episodes: ExportEpisodeReport[];
+  skipped: ExportEpisodeReport[];
+}
+
+/** What reading the written dataset back off disk proved.
+ *
+ * `ok` false with an empty `issues` cannot happen: the issues are what makes it
+ * false. An export is not finished until this comes back ok -- everything it
+ * checks looks like success at the moment of writing. */
+export interface VerifyReport {
+  repo_id: string;
+  dataset_path: string;
+  fps: number;
+  action_space: string;
+  n_episodes: number;
+  n_frames: number;
+  state_max_abs_error: number;
+  action_max_abs_error: number;
+  target_position_error_max_m: number;
+  target_angle_error_max_rad: number;
+  gripper_error_max_deg: number;
+  timestamp_max_error_s: number;
+  video_frames: Record<string, number>;
+  issues: string[];
+  ok: boolean;
+}
+
+export type ExportPhase =
+  | "idle"
+  | "exporting"
+  | "verifying"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface ExportProgress {
+  phase: ExportPhase;
+  running: boolean;
+  repo_id: string;
+  task: string;
+  dataset_path: string;
+  episodes_done: number;
+  episodes_total: number;
+  frames_done: number;
+  current_episode: string;
+  error: string;
+  report: ExportReport | null;
+  verify_report: VerifyReport | null;
+  log: string[];
+}
+
+/** What the dry run answers: would this selection export, and as what. */
+export interface ExportPlan {
+  report: ExportReport;
+  usable: number;
+  config: Record<string, any>;
 }

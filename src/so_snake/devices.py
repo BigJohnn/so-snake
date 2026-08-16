@@ -327,6 +327,13 @@ class CameraDevice:
     stable: bool = False
     bus: str = ""
     thumbnail: str = ""
+    # Focus measure, contrast, and a note when the picture carries too little
+    # detail to tell this camera apart from another by eye. Advisory only --
+    # nothing refuses a device on account of it, and a wrist camera focused at
+    # gripper distance reads low by design. See `LOW_DETAIL_LAPLACIAN_VAR`.
+    sharpness: float = 0.0
+    contrast: float = 0.0
+    note: str = ""
 
     def label(self) -> str:
         bits = [f"index {self.index}", f"{self.width}x{self.height}"]
@@ -334,6 +341,8 @@ class CameraDevice:
             bits.append(self.name)
         if self.stable:
             bits.append(str(self.device))
+        if self.note:
+            bits.append("hard to identify")
         return "  ".join(bits)
 
 
@@ -355,6 +364,9 @@ def scan_cameras(max_index: int = 8, thumbnails: bool = False) -> list[CameraDev
             stable=bool(d.get("stable", False)),
             bus=str(d.get("bus", "")),
             thumbnail=str(d.get("thumbnail", "")),
+            sharpness=float(d.get("sharpness", 0.0)),
+            contrast=float(d.get("contrast", 0.0)),
+            note=str(d.get("note", "")),
         )
         for d in list_devices(max_index=max_index, thumbnails=thumbnails)
     ]

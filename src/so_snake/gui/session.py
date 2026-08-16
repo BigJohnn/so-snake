@@ -41,6 +41,7 @@ from ..data import (
     ReplayConfig,
     ReplayStep,
     inspect_episode,
+    select_encoder,
 )
 from ..m0_perception import CameraRig, frame_for_preview
 from ..m4_execution.motion import MoveOutcome, move_to_joints
@@ -392,7 +393,50 @@ class SessionManager:
         self.log("info", f"session start: {spec.backend} backend, {spec.source} source"
                          + (" (adopting the held arm)" if adopted else ""))
         self._spawn(self._run_teleop, "so-snake-teleop")
+        if cameras is not None and getattr(cameras, "roles", ()):
+            # Not `_spawn`: that records the thread as *the* worker, which is
+            # the one `stop()` joins. A warmup is a detached side errand and
+            # must not take the control loop's place in that slot.
+            threading.Thread(
+                target=self._warm_encoder, name="so-snake-encoder-warmup", daemon=True
+            ).start()
         return self.status()
+
+    def _warm_encoder(self) -> None:
+        """Pay for the encoder probe now, while nothing is being recorded.
+
+        Choosing an encoder means really encoding with it, which at 1080p costs
+        about 700 ms. That used to happen on the first press of record, under
+        the session lock, which is the same lock the control loop takes to write
+        its telemetry -- so the first frame of every take stalled for the whole
+        probe. On a 292-step take that single step pulled the average rate from
+        30.1 Hz to 28.2, and the exported dataset laid every frame on the wrong
+        grid as a result.
+
+        The answer is cached in `so_snake.data.video`, so this is the only time
+        it is paid. It runs on its own thread and its failure is not fatal: if
+        no encoder works, the recorder will say so on the press of record, which
+        is where that message belongs.
+        """
+        try:
+            with self._lock:
+                cameras = self._cameras
+            if cameras is None:
+                return
+            # The real frame size, or nothing: an encoder verified at 640x480 is
+            # not evidence about 1920x1080, and warming the wrong key would
+            # leave the stall exactly where it was.
+            for role in cameras.roles:
+                frame = cameras.read_latest(role)
+                if frame is not None:
+                    select_encoder(
+                        self.config.video,
+                        width=int(frame.shape[1]),
+                        height=int(frame.shape[0]),
+                    )
+                    return
+        except Exception as exc:  # noqa: BLE001 - a warmup that fails is not a session that fails
+            self.log("warn", f"encoder warmup skipped: {type(exc).__name__}: {exc}")
 
     def _run_teleop(self) -> None:
         assert self._loop is not None
@@ -602,14 +646,70 @@ class SessionManager:
         spec: RigSpec,
         replay: ReplayConfig,
     ) -> dict[str, Any]:
-        """Play an episode back. Refuses if the static inspection finds an error."""
+        """Play a recorded take back. Refuses if the inspection finds an error."""
+        return self._begin_replay(
+            lambda: self.store.load(episode_id), episode_id, "take", spec, replay
+        )
+
+    def start_dataset_replay(
+        self,
+        dataset_path: Path,
+        episode_index: int,
+        spec: RigSpec,
+        replay: ReplayConfig,
+    ) -> dict[str, Any]:
+        """Play one episode of an *exported dataset* back onto the arm.
+
+        The last link of the export contract. `verify` proves the rows on disk
+        still invert to the targets that were recorded; this proves an arm will
+        follow them, through the identical safety layer a recorded take is
+        replayed through -- the episode is rebuilt into the same `Episode` shape
+        and handed to the same `EpisodeReplayer`.
+
+        Task mode only, and that is not a limitation: the dataset carries no
+        joint stream by design, so the joints are solved from the targets, which
+        is exactly what task-mode replay of a take does anyway. Asking for joint
+        mode would replay this function's own arithmetic and prove nothing.
+        """
+        from ..data.export import episode_from_dataset
+
+        path = Path(dataset_path)
+        if replay.mode != "task":
+            raise ValueError(
+                "an exported dataset can only be replayed in task mode -- it carries "
+                "no joint stream, by design"
+            )
+        return self._begin_replay(
+            lambda: episode_from_dataset(path, episode_index, so_snake_config=self.config),
+            f"{path.name}#{episode_index}",
+            "dataset",
+            spec,
+            replay,
+        )
+
+    def _begin_replay(
+        self,
+        load: Callable[[], Any],
+        label: str,
+        source: str,
+        spec: RigSpec,
+        replay: ReplayConfig,
+    ) -> dict[str, Any]:
+        """Everything a replay does regardless of where the episode came from.
+
+        `source` is carried into the snapshot so the UI can say which artifact is
+        driving the arm. A recorded take and a dataset built from it are
+        different things, and an operator watching the arm move needs to know
+        which of the two they are watching -- especially when the point of the
+        exercise is to find out whether the *export* is faithful.
+        """
         spec.validate()
         # Adopts a held arm for the same reason teleop does: the replayer walks
         # to the episode's first pose itself, and it should start that walk from
         # the home pose the operator homed to, not from a sagged one.
         backend, _adopted = self._acquire_backend(spec, "start a replay")
         with self._lock:
-            episode = self.store.load(episode_id)
+            episode = load()
             issues = inspect_episode(
                 episode,
                 self.config,
@@ -628,7 +728,9 @@ class SessionManager:
             self._replay = {
                 "active": True,
                 "phase": "approach",
-                "episode_id": episode_id,
+                "episode_id": label,
+                # "take" or "dataset" -- which artifact is driving the arm.
+                "source": source,
                 "mode": replay.mode,
                 "speed": replay.speed,
                 "step": 0,
@@ -646,7 +748,11 @@ class SessionManager:
 
         for issue in issues:
             self.log("warn" if issue.level == "warning" else "info", f"replay: {issue.message}")
-        self.log("info", f"replay {episode_id} in {replay.mode} mode at {replay.speed:g}x onto {spec.backend}")
+        self.log(
+            "info",
+            f"replay {source} {label} in {replay.mode} mode at {replay.speed:g}x "
+            f"onto {spec.backend}",
+        )
         self._spawn(self._run_replay, "so-snake-replay")
         return self.status()
 
@@ -1051,7 +1157,7 @@ def _idle_cameras() -> dict[str, Any]:
 
 
 def _idle_replay() -> dict[str, Any]:
-    return {"active": False, "phase": "idle", "episode_id": "", "mode": "", "speed": 1.0,
+    return {"active": False, "phase": "idle", "episode_id": "", "source": "", "mode": "", "speed": 1.0,
             "step": 0, "total": 0, "approach_remaining_deg": 0.0, "approach_residual_deg": 0.0,
             "completed": False, "aborted_reason": "", "issues": [], "summary": {}}
 

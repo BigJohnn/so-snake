@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type SyntheticEvent } from "react";
 import { ApiError, api, episodeVideoUrl } from "../api";
+import { ExportPanel } from "../components/ExportPanel";
 import { SeriesPlot } from "../components/SeriesPlot";
 import { Banner, Card, Empty, Field, Pill, Stat } from "../components/ui";
 import type { EpisodeDetail, EpisodeMeta } from "../types";
@@ -160,6 +161,10 @@ export function EpisodesPage() {
               <Empty>{episodes.length ? "选一条看看" : "还没有可看的 episode"}</Empty>
             </Card>
           )}
+          {/* Last, under the take being judged: exporting is what happens after
+              the review, and a button for it above the video would invite
+              pressing it before the reviewing is done. */}
+          {episodes.length ? <ExportPanel /> : null}
         </div>
       </div>
     </>
@@ -198,7 +203,7 @@ function TakeRow({
   );
 }
 
-/** The episode's cameras, kept in step with the plots.
+/** The episode's cameras, kept in step with the plots and with each other.
  *
  * Alignment is by **frame index, not by timestamp**. The recorder writes one
  * video frame per control step, so video frame i is row i -- but the file's
@@ -206,9 +211,29 @@ function TakeRow({
  * slower, so video time and recorded time drift apart over a take. Index is the
  * coordinate both halves genuinely share.
  *
- * Both cameras play from one clock: the first is the timekeeper and the second
- * is nudged back to it when they drift by more than a couple of frames, which
- * is what keeps a wrist view and a scene view showing the same instant.
+ * The first camera carries the controls and is the timekeeper; the others
+ * follow it. Following means **its transport is mirrored onto them** -- play,
+ * pause, seek, playback rate -- and only then is the index nudge a correction.
+ *
+ * That distinction is the whole of this component. It previously mirrored
+ * nothing: the followers had no controls and nobody ever called `play()` on
+ * them, so the only thing that ever moved them was the seek in the index
+ * effect below, driven by `timeupdate`.
+ *
+ * ## Why the position is sampled on an animation frame, not from `timeupdate`
+ *
+ * `timeupdate` is specified to fire *at least* every 250 ms, and browsers take
+ * that as licence to fire it at about 4 Hz to keep the CPU asleep. An index
+ * derived from it therefore advances in quanta of `fps / 4` frames: at 30 fps
+ * the counter read 1, 9, 17, 25 -- eight frames at a time -- and the plot
+ * cursor jumped in the same steps, however smoothly the video itself played.
+ *
+ * `currentTime` is continuous; only the *event* is coarse. So the position is
+ * sampled on `requestAnimationFrame` while playing, and `onIndex` fires only
+ * when the derived index actually changes -- at most once per video frame.
+ * `SeriesPlot` memoises everything whose cost scales with sample count, so
+ * moving the cursor at that rate rebuilds one `<line>` and not five
+ * 1200-point paths.
  */
 function EpisodeVideos({
   id,
@@ -224,16 +249,74 @@ function EpisodeVideos({
   onIndex: (i: number) => void;
 }) {
   const refs = useRef<Record<string, HTMLVideoElement | null>>({});
+  const raf = useRef(0);
+  // The last index this component reported, so the rAF loop can fire `onIndex`
+  // only on a real change. Kept in a ref rather than read from the `index`
+  // prop: the loop must not be torn down and rebuilt on every frame it causes.
+  const reported = useRef(-1);
+
+  const followers = (): HTMLVideoElement[] =>
+    cameras.slice(1).map((role) => refs.current[role]).filter((v): v is HTMLVideoElement => !!v);
 
   // Seeking is driven from outside (a click on a plot); playing is driven from
   // inside (the element's own clock). Only jump when the two disagree by more
-  // than a couple of frames, or every timeupdate would fight the playback.
+  // than a couple of frames, or every position sample would fight the playback.
   useEffect(() => {
     const want = index / fps;
     for (const video of Object.values(refs.current)) {
       if (video && Math.abs(video.currentTime - want) > 2 / fps) video.currentTime = want;
     }
   }, [index, fps]);
+
+  // Stop the sampler if the component goes away mid-play.
+  useEffect(() => () => cancelAnimationFrame(raf.current), []);
+
+  const sample = () => {
+    const lead = refs.current[cameras[0]];
+    if (!lead) return;
+    const at = Math.round(lead.currentTime * fps);
+    if (at !== reported.current) {
+      reported.current = at;
+      onIndex(at);
+    }
+    if (!lead.paused && !lead.ended) raf.current = requestAnimationFrame(sample);
+  };
+
+  const startSampling = () => {
+    cancelAnimationFrame(raf.current);
+    raf.current = requestAnimationFrame(sample);
+  };
+  const stopSampling = () => {
+    cancelAnimationFrame(raf.current);
+    sample(); // one last read, so a pause lands on the exact frame shown
+  };
+
+  const lead = {
+    onPlay: () => {
+      for (const video of followers()) void video.play().catch(() => undefined);
+      startSampling();
+    },
+    onPause: stopSampling,
+    onEnded: stopSampling,
+    // A seek is mirrored the moment it lands rather than waiting for the next
+    // sample: scrubbing the scene view should move the wrist view with it.
+    onSeeked: (event: SyntheticEvent<HTMLVideoElement>) => {
+      const t = event.currentTarget.currentTime;
+      for (const video of followers()) video.currentTime = t;
+      if (event.currentTarget.paused) sample();
+    },
+    onRateChange: (event: SyntheticEvent<HTMLVideoElement>) => {
+      const rate = event.currentTarget.playbackRate;
+      for (const video of followers()) video.playbackRate = rate;
+    },
+    // Kept as a backstop only. It is far too coarse to drive the cursor (see
+    // the component docstring), but it costs nothing and covers the case where
+    // the position moves without `play` firing.
+    onTimeUpdate: () => {
+      const video = refs.current[cameras[0]];
+      if (video && video.paused) sample();
+    }
+  };
 
   return (
     <div className="videos" style={{ gridTemplateColumns: `repeat(${cameras.length}, minmax(0, 1fr))` }}>
@@ -246,12 +329,11 @@ function EpisodeVideos({
             src={episodeVideoUrl(id, role)}
             controls={i === 0}
             muted
-            preload="metadata"
-            onTimeUpdate={
-              i === 0
-                ? (event) => onIndex(Math.round(event.currentTarget.currentTime * fps))
-                : undefined
-            }
+            // The followers are played, so they need frames ahead of the
+            // playhead. "metadata" was enough while they were only ever
+            // seeked, and is not now.
+            preload={i === 0 ? "metadata" : "auto"}
+            {...(i === 0 ? lead : {})}
           />
           <div className="tag">{role}</div>
         </div>

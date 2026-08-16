@@ -16,8 +16,9 @@ for an environment reason -- a dropped episode cannot be re-taken once the
 operator and the arm have moved on.
 
 `LeRobotDataset` remains the training-time format. Exporting these episodes into
-it is a conversion, and belongs on the training machine where lerobot is
-installed, not in the recording path. That converter is still to be written.
+it is a conversion that needs lerobot, so it lives in `export.py` behind a lazy
+import and stays out of the recording path -- recording must not acquire a
+dependency that training happens to want.
 
 ## The column contract
 
@@ -57,7 +58,13 @@ FRAMES_NAME = "frames.npz"
 
 # Bumped whenever a column changes meaning. Readers refuse anything newer than
 # they know; anything older is either migrated or reported, never guessed at.
-FORMAT_VERSION = 1
+#
+# v2 added `observation.state.gripper_deg`. v1 episodes do not have it and never
+# will -- the bus read it, the recorder threw it away. They stay readable, and
+# `Episode.measured_gripper_deg` reports whether what it returns was measured or
+# substituted, so a consumer that needs the real thing can refuse rather than
+# train on the commanded angle believing it was the observed one.
+FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -91,6 +98,7 @@ COLUMNS: tuple[Column, ...] = (
     Column("action.joint.commanded_deg", lambda r: r.commanded_joints_deg, "f8", 5),
     # -- observation.state: what came back -----------------------------------
     Column("observation.state.joints_deg", lambda r: r.measured_joints_deg, "f8", 5),
+    Column("observation.state.gripper_deg", lambda r: r.measured_gripper_deg, "f8"),
     Column("observation.state.task_pose", lambda r: r.achieved_task_pose, "f8", 5),
     Column("observation.state.position", lambda r: r.achieved_position, "f8", 3),
     Column("observation.state.quaternion", lambda r: r.achieved_quaternion, "f8", 4),
@@ -241,6 +249,87 @@ class Episode:
     def task_target(self) -> np.ndarray:
         """`(n, 5)` the `(x, y, z, pitch, roll)` targets, post-clamp and post-atlas."""
         return self.column("action.task.target")
+
+    @property
+    def task_pose(self) -> np.ndarray:
+        """`(n, 5)` the `(x, y, z, pitch, roll)` the arm actually reached."""
+        return self.column("observation.state.task_pose")
+
+    @property
+    def measured_hz(self) -> float:
+        """The rate this take actually held, from the **median** step period.
+
+        Not `meta.control_hz`, which is what the loop was *configured* for --
+        the two agreed only after the pacing fix in `so_snake.pacing`, and
+        everything recorded before it was configured for 30 Hz and ran at 26.
+
+        And not `n_steps / duration_s` either, which is what this used to be.
+        That average is dragged by a single stall, and there is reliably one: the
+        first frame of a take blocks while the encoder is chosen. Measured on a
+        292-step take, one 711 ms step out of 292 pulled the average from 30.1 Hz
+        down to 28.2 -- a 6% error in the number the exported dataset lays every
+        frame on, caused by 0.3% of the steps. The median ignores it and reports
+        the period 99.7% of the steps actually ran at, which is the spacing every
+        consecutive-frame transition a policy learns from really has.
+
+        The two agree when nothing stalls: across the 43 takes recorded before
+        the pacing fix, the median-of-periods spread (26.27-26.62 Hz) is tighter
+        than the duration-derived one (25.84-26.93) and both round to the same
+        26 Hz dataset rate.
+
+        Honest, which means it is meaningless for a take that was not paced to
+        the wall clock at all: an offline `realtime=False` run reports thousands
+        of hertz because that is genuinely how fast it went. Use `playback_hz`
+        to put frames back on a time axis.
+        """
+        fallback = float(self.meta.control_hz)
+        duration = float(self.meta.duration_s)
+        if duration > 0.0 and self.meta.n_steps > 0:
+            fallback = float(self.meta.n_steps) / duration
+
+        periods = self.frames.get("diagnostics.loop_dt_s")
+        if periods is None or len(periods) < 3:
+            return fallback
+        # Row 0 is the gap from the loop's start to its first step, not a step
+        # period -- for a take started mid-session it is however long the
+        # operator waited before pressing record.
+        median = float(np.median(np.asarray(periods[1:], dtype=float)))
+        if median <= 0.0:
+            return fallback
+        return 1.0 / median
+
+    @property
+    def playback_hz(self) -> float:
+        """The rate to replay these frames at, or lay them on a time axis at.
+
+        The measurement where it is credible, the configured rate where it is
+        not. A take recorded in real time missed its configured rate by at most
+        a few percent -- 26 against 30 before the pacing fix, the worst this
+        bench ever saw -- while a take recorded offline ran two orders of
+        magnitude faster and has no wall-clock meaning to recover. Nothing lands
+        in the gap between those two cases, so a plausibility band separates
+        them cleanly, and the fallback is the only number left that means
+        anything.
+        """
+        measured = self.measured_hz
+        configured = float(self.meta.control_hz)
+        if configured <= 0.0:
+            return measured
+        if 0.5 <= measured / configured <= 1.5:
+            return measured
+        return configured
+
+    def measured_gripper_deg(self) -> tuple[np.ndarray, bool]:
+        """`(n,)` gripper angle, and whether it was measured rather than assumed.
+
+        Format v1 dropped the bus reading, so for those episodes the commanded
+        angle stands in. It is the same number right up to the moment the jaws
+        touch something, which is the moment you wanted it for. Callers get the
+        flag so the substitution is theirs to accept, not ours to hide.
+        """
+        if "observation.state.gripper_deg" in self.frames:
+            return self.column("observation.state.gripper_deg"), True
+        return self.gripper_cmd_deg, False
 
     def full_command_deg(self) -> np.ndarray:
         """`(n, 6)` arm joints with the gripper appended, in backend order."""

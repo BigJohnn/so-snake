@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -314,3 +316,60 @@ class TestTeleopLoop:
             return np.array([r.commanded_joints_deg for r in stats.records])
 
         assert np.allclose(run(), run())
+
+
+class TestRealtimePacing:
+    """The loop must hold the rate it was configured for.
+
+    It used to miss by 12%: `time.sleep` returns late (macOS coalesces timer
+    wake-ups, and the slack scales with the requested sleep -- ~4 ms on a 33 ms
+    period here), and pacing to `period - elapsed` measured from the top of the
+    iteration books every one of those overshoots permanently. The arm was never
+    short of time; a step's work is about 5 ms of a 33 ms budget. Recorded
+    episodes came out at 26 Hz against a configured 30, and the exporter had to
+    measure the real rate to keep the videos honest.
+    """
+
+    def test_holds_the_configured_rate(self, ik: TaskIK5D) -> None:
+        config = SoSnakeConfig()
+        hz = config.teleop.control_hz
+        steps = int(hz)  # one second of wall clock
+
+        loop = make_loop(ScriptedSource.from_waveform(n_steps=steps), ik)
+        start = time.perf_counter()
+        loop.run(max_steps=steps, realtime=True)
+        elapsed = time.perf_counter() - start
+
+        measured = steps / elapsed
+        # 3% either way. The old `period - elapsed` pacing lands at ~26.3 Hz,
+        # which is 12% low and well outside this.
+        assert measured == pytest.approx(hz, rel=0.03), f"{measured:.2f} Hz vs {hz} Hz"
+
+    def test_a_stalled_step_does_not_buy_a_burst_of_unpaced_ones(self, ik: TaskIK5D) -> None:
+        """Overrun is repaid up to one period, then written off.
+
+        Without the cap, a step that blocked for 400 ms -- this bench has seen
+        that from a USB stall -- leaves the deadline far enough in the past that
+        the next dozen steps run flat out, driving the servo bus faster than the
+        arm was ever commanded at.
+        """
+        config = SoSnakeConfig()
+        period = 1.0 / config.teleop.control_hz
+        steps = 12
+
+        loop = make_loop(ScriptedSource.from_waveform(n_steps=steps), ik)
+        stalled: list[int] = []
+
+        def stall_once(record) -> None:  # noqa: ANN001 - StepRecord, from the loop
+            if record.index == 1 and not stalled:
+                stalled.append(record.index)
+                time.sleep(10 * period)
+
+        start = time.perf_counter()
+        loop.run(max_steps=steps, realtime=True, on_step=stall_once)
+        elapsed = time.perf_counter() - start
+
+        assert stalled, "the stall never ran"
+        # The 10-period stall is absorbed, and every other step is still paced:
+        # floor is the stall itself plus one period for each remaining step.
+        assert elapsed > (steps - 2) * period

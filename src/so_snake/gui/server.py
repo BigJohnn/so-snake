@@ -33,10 +33,11 @@ from urllib.parse import parse_qs, urlparse
 import numpy as np
 
 from ..config import REPO_ROOT, SoSnakeConfig
-from ..data import DEFAULT_EPISODE_ROOT, ReplayConfig
+from ..data import ACTION_SPACES, DEFAULT_EPISODE_ROOT, ExportConfig, ReplayConfig
 from ..devices import DeviceDetectionError, detect_arm_port, list_serial_ports
-from ..m0_perception import CAMERA_ROLES, CameraSpec, list_devices
+from ..m0_perception import CAMERA_ROLES, CameraSpec, scan_devices
 from ..rig import RigSpec, availability, mujoco_import_error
+from .exporter import DEFAULT_DATASET_ROOT, Exporter
 from .preview import encode_png, ensure_headless_gl, placeholder_png
 from .roadmap import roadmap_payload
 from .session import SessionManager
@@ -60,9 +61,11 @@ class Gateway:
         config: SoSnakeConfig | None = None,
         episode_root: Path = DEFAULT_EPISODE_ROOT,
         frontend_dist: Path = DEFAULT_FRONTEND_DIST,
+        dataset_root: Path = DEFAULT_DATASET_ROOT,
     ) -> None:
         self.config = config or SoSnakeConfig()
         self.session = SessionManager(self.config, episode_root)
+        self.exporter = Exporter(self.session.store, self.config, dataset_root)
         self.frontend_dist = Path(frontend_dist)
         self.lock = threading.Lock()
 
@@ -149,7 +152,83 @@ class Gateway:
                 "cannot scan for cameras while a session is running -- "
                 "the scan would open devices the session is using"
             )
-        return {"devices": list_devices(), "roles": list(CAMERA_ROLES)}
+        scan = scan_devices()
+        return {
+            "devices": scan["devices"],
+            "diagnostics": scan["diagnostics"],
+            "roles": list(CAMERA_ROLES),
+        }
+
+    def export_config_from_body(self, body: dict[str, Any]) -> ExportConfig:
+        """Build an `ExportConfig` from a request body, taking nothing on trust."""
+        repo_id = str(body.get("repo_id", "")).strip()
+        if not repo_id:
+            raise ValueError("repo_id is required")
+        # A repo id becomes a directory name; keep it to the shape lerobot uses
+        # rather than letting the UI post something that escapes the root.
+        if repo_id.count("/") != 1 or not all(part.strip() for part in repo_id.split("/")):
+            raise ValueError(f"repo_id must look like owner/name, got {repo_id!r}")
+        if any(part in ("..", ".") for part in Path(repo_id).parts):
+            raise ValueError("repo_id must not contain path traversal")
+
+        action_space = str(body.get("action_space", "delta"))
+        if action_space not in ACTION_SPACES:
+            raise ValueError(f"action_space must be one of {ACTION_SPACES}")
+
+        cameras = body.get("cameras") or list(CAMERA_ROLES)
+        if not isinstance(cameras, list) or not all(c in CAMERA_ROLES for c in cameras):
+            raise ValueError(f"cameras must be a subset of {CAMERA_ROLES}")
+
+        raw_resolution = body.get("resolution") or [240, 320]
+        try:
+            height, width = (int(v) for v in raw_resolution)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("resolution must be [height, width]") from exc
+        # Clamped rather than trusted: the frames are decoded and re-encoded at
+        # this size, and a UI bug posting 8000 would fill the disk.
+        height = int(np.clip(height, 64, 1080))
+        width = int(np.clip(width, 64, 1920))
+
+        fps = body.get("fps")
+        root = self.exporter.dataset_root / repo_id.split("/", 1)[1]
+        return ExportConfig(
+            repo_id=repo_id,
+            root=root,
+            task=(str(body["task"]) if body.get("task") else None),
+            episode_ids=tuple(str(e) for e in (body.get("episode_ids") or ())),
+            action_space=action_space,
+            cameras=tuple(cameras),
+            resolution=(height, width),
+            fps=(int(fps) if fps else None),
+            include_aborted=bool(body.get("include_aborted", False)),
+            episode_root=self.session.store.root,
+        )
+
+    def start_dataset_replay(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Drive the arm from an exported dataset.
+
+        The last link of the export contract, and the reason it goes through
+        `SessionManager` rather than the exporter: this moves the arm, so it
+        obeys the same one-thing-at-a-time rule as teleop and take replay.
+        """
+        path = self.exporter.resolve(str(body.get("dataset", "")))
+        index = int(body.get("episode_index", 0))
+        replay = replay_from_body({**body, "mode": "task"})
+        return self.session.start_dataset_replay(
+            path, index, spec_from_body(body), replay
+        )
+
+    def start_export(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Refuse while the arm is being driven; see `exporter`'s docstring."""
+        if self.session.busy and not self.session.is_held:
+            raise RuntimeError(
+                f"cannot export while the arm is busy ({self.session.mode}) -- decoding "
+                "and re-encoding two video streams would compete with the control loop "
+                "for the machine. Stop the session first."
+            )
+        return self.exporter.start(
+            self.export_config_from_body(body), do_verify=bool(body.get("verify", True))
+        )
 
     def episodes_payload(self) -> dict[str, Any]:
         return {
@@ -368,6 +447,10 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(self.gateway.cameras_payload)
         elif path == "/api/ports":
             self._guard(self.gateway.ports_payload)
+        elif path == "/api/export/tasks":
+            self._guard(self.gateway.exporter.tasks)
+        elif path == "/api/export/status":
+            self._guard(self.gateway.exporter.progress)
         elif path == "/api/episode/video":
             self._serve_episode_video(_str_param(query, "id"), _str_param(query, "camera"))
         elif path == "/api/preview.png":
@@ -559,6 +642,16 @@ class GuiHandler(BaseHTTPRequestHandler):
             )
         elif path == "/api/episode/delete":
             self._guard(lambda: {"deleted": session.store.delete(str(body.get("id", "")))})
+        elif path == "/api/export/plan":
+            # The dry run. Synchronous and writes nothing, so it is a plain
+            # request/response rather than a job to poll.
+            self._guard(
+                lambda: self.gateway.exporter.plan(self.gateway.export_config_from_body(body))
+            )
+        elif path == "/api/export/start":
+            self._guard(lambda: self.gateway.start_export(body))
+        elif path == "/api/export/cancel":
+            self._guard(self.gateway.exporter.cancel)
         else:
             self._error(HTTPStatus.NOT_FOUND, f"no such endpoint: {path}")
 

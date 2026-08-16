@@ -166,12 +166,117 @@ PYTHONPATH=src .venv/bin/python scripts/teleop_real_arm.py \
 `SOFollowerBackend` 用 lerobot 的 `SOFollowerRobotConfig`,`max_relative_target` 是
 后端硬件层钳位,和回路自己的 `max_joint_step_deg`(6°/步)叠加。
 
+## 回路频率:配的 30 Hz,以前跑 26 Hz
+
+**已经修好了,现在是实测 30.00 Hz。**结论先放这里,因为找它的过程里排除掉的东西比找到
+的那个更有用。
+
+一句话:**不是活干得慢,是 `time.sleep` 还得晚。**
+
+每步的活加起来只有约 **5 ms**,占 33 ms 预算的 15%,全是实测:
+
+| 环节 | 实测 | 说明 |
+|---|---|---|
+| 舵机总线读 `sync_read` | **1.49 ms** | 6 个舵机一包,1 Mbps |
+| `send_action` 里再读一次 | 1.49 ms | `max_relative_target` 要拿当前位置来钳位,lerobot 自己也标了 `/!\ Slower fps expected` |
+| `sync_write` 下发 | ~0.5 ms | 单向,不等回包 |
+| 5D IK + FK | **0.36 ms** | `ik.solve` 0.274,`task_pose` 0.049 |
+| Switch Pro 手柄 `get_action` | **1.37 ms** | hidapi 非阻塞,1 ms 超时 |
+| **合计** | **≈ 5 ms** | |
+
+相机被完全排除了:**0 路相机的 take 和 2 路相机的 take,周期都是 37.6–37.9 ms**,一模
+一样。采集在 lerobot 自己的线程上,编码也在独立线程上。
+
+真正的原因是 macOS 的 timer coalescing —— 内核会把线程的唤醒时刻往外取整,好把多个唤醒
+凑到一起、让核多睡一会儿,而它加的余量**和请求的睡眠时长成正比**:
+
+| 请求 | 实际返回 | 多睡 |
+|---|---|---|
+| 1.0 ms | 1.46 ms | +0.5 ms |
+| 5.0 ms | 6.19 ms | +1.2 ms |
+| 28.3 ms | 32.42 ms | **+4.1 ms** |
+| 33.3 ms | 37.32 ms | **+4.0 ms** |
+
+`sleep(33.3 ms)` 回来是 37.3 ms —— 和 43 条 take 实测的周期中位数 **37.7 ms** 几乎一样。
+而旧代码按 `period - 本步已用时间` 睡,是从**本次迭代开头**算的,于是每一次多睡的 4 ms
+都被永久记账,回路只会往后掉、掉了就再也补不回来。
+
+周期分布也印证这是稳态而不是偶发卡顿:p50 37.7 ms、p90 39.5 ms,**只有 0.3% 的步超过
+60 ms**。不是「偶尔卡一下拉低了均值」,是每一步都稳定慢 4 ms。
+
+修法在 [`src/so_snake/pacing.py`](src/so_snake/pacing.py),两件事:
+
+* **睡到一个按周期递推的绝对 deadline**,不是从迭代开头算剩余 —— 晚了的一步由下一步的
+  短等待还回来,栅格自己收敛;
+* **最后 6 ms 自旋不睡** —— 这才是真正守住频率的部分,因为 `sleep` 晚回来的那部分,
+  靠 `sleep` 本身是没法要求它别晚的。代价是每 33 ms 里最多 6 ms 单核自旋。
+
+外加一条:**补偿最多补一个周期**。一步要是卡了 400 ms(本机 p99.9 就是 404 ms,USB 抖
+一下就有),deadline 会落在很远的过去,不封顶的话接下来十几步会一路不等待地冲出去,
+按比操作者当初快得多的速率去打总线。超过一个周期就认赔,栅格从当下重开。
+
+回路和回放共用这个 `RateKeeper`。回放那边还顺带修了一个反向的错:它按
+`meta.control_hz`(配置值 30)定速,而 take 实际是 26 —— 两个 bug 原来**刚好互相抵消**,
+所以回放速度看着是对的。只修其中一个会让回放快 15%,所以两个一起修:现在按
+`episode.playback_hz`(实测值)播。
+
+### 还有一个把 30 Hz 藏起来的东西:按录制键那 700 ms
+
+回路修好之后,第一条新 take 试算出来仍然是 **28.2 Hz**,不是 30。原因和上面无关:
+
+`n_steps / duration_s` 是**均值**,而每条 take 里有且只有一次大卡顿 —— **第 1 步 711 ms**。
+根因是按下录制时要选编码器,而 `select_encoder` 是**真的编三帧** 1080p 来验证,实测
+**678 ms**;它在 `start_recording` 持有的会话锁里跑,而控制回路每步写遥测也要这把锁。
+于是每条 take 的第一帧必然停一次。292 步里的这一步(**0.3%**)把均值从 **30.1 拽到
+28.2**(**6%** 的误差),而导出会拿这个数当整条 take 的时间栅格。
+
+两头都修了:
+
+* **帧率改测「步周期的中位数」**(`1 / median(dt)`),不再用均值 —— 中位数报的是另外
+  291 步真正的周期,也就是策略学到的每一对相邻帧真实的间隔。老的 43 条不受影响(两种
+  算法都给 26 Hz,而且中位数版本的离散度更小:26.27–26.62 对 25.84–26.93);
+* **编码器探测结果缓存,并在开会话时预热**(不是按录制时)。按下录制的代价从
+  **678 ms 降到 0.05 ms**。探测按 key 加锁,所以就算刚开会话就按录制,也是等同一次
+  探测的结果,不会重复探一遍。
+
+改完:同一条 take 测出 **30.01 Hz**,与 30 的偏差 **0.0%**。
+
+> 已录的 43 条 take 仍然是 26 Hz 的,新录的是 30 Hz。两批不能混进同一个数据集 ——
+> 见上面「帧率是量出来的」。筛选会自动拦(`fps_tolerance` 8%,26 vs 30 差 15%),
+> 并且报告会明说这是「另一批」而不是「一条坏 take」。
+
+### 一条 take 的帧率是录出来的,不是导出来的
+
+**8-16 之前录的每一条 take 都是 26 Hz,导出只能如实报 26。**试算某个 task 出来是 26 而
+不是 30,先看它是什么时候录的:
+
+| take | 录制时间 | 步周期中位数 | 实测 |
+|---|---|---|---|
+| `ep_20260810_211649` | 08-10 13:16 | 37.91 ms | 26.38 Hz |
+| `ep_20260810_232308`(`把牛牛放在胶带上`) | 08-10 15:23 | 37.90 ms | 26.39 Hz |
+| `ep_20260812_213956` | 08-12 13:39 | 37.56 ms | 26.62 Hz |
+| `ep_20260816_143651` | **08-16 06:36** | **33.33 ms** | **30.01 Hz** |
+
+分界线正好在修复那天。37.9 ms 也对得上第一性原理的账:约 5 ms 干活 + `sleep(28.3)`
+实际睡 32.4 ms = 37.4 ms,剩下的约 0.5 ms 是这条 take 带着两路相机而基准测试没带。
+
+所以 `把牛牛放在胶带上`(只有 1 条,08-10 录的)导出必然是 26 Hz。**重导不会变高,
+只能重录。**试算报告现在会直接这么说:
+
+```
+rate: takes ran 26.39-26.39 Hz, worst deviation from 26 Hz is 1.5%
+  ^ 1/1 were recorded against a configured 30 Hz and did not hold it. That is
+    baked into those takes -- the export reports what the arm actually did, so
+    re-exporting cannot raise it. Re-record them to get the configured rate.
+```
+
 ## 录制与回放
 
 一条 episode 是一个目录:`meta.json`(录制条件 + 配置快照 + 指标)加 `frames.npz`
 (每个控制步一行)。用 npz 而不是 parquet,是因为 numpy 是本仓唯一的基础依赖 ——
 录制是整条链路里最不能因为环境原因失败的一环,人和臂都挪开之后那条演示就补不回来了。
-`LeRobotDataset` 仍是训练格式,转换器该待在装了 lerobot 的训练机上,还没写。
+`LeRobotDataset` 仍是训练格式,转换见下面「导出训练集」—— 它对 lerobot 的 import 是
+惰性的,录制路径不会因此多一个依赖。
 
 列名就是 `TeleopLoop` 文档里那套 dataset layout:`action.raw.*`(设备原样上报)、
 `action.task.*`(策略的训练目标)、`action.joint.*`(发给舵机的)、
@@ -224,6 +329,190 @@ PYTHONPATH=src .venv/bin/python scripts/record_episode.py --backend real --sourc
 **deg/s** 而不是 deg/步 限速(否则 2× 速度会让臂真的快一倍而每步检查照样通过),按
 **当前**配置的关节限位钳位,以及在 MuJoCo 下逐帧检查网格离地。
 
+## 导出训练集(LeRobotDataset)
+
+**GUI 里有按钮**:数据集页翻到底,「导出训练集」。选技能 → 试算 → 导出。导出跑在后台
+线程上,能取消,关掉浏览器再打开会接回正在跑的那次。臂在动的时候会拒绝导出 —— 转码两路
+视频是本仓最重的活,而回路现在靠自旋守住 30 Hz,两者抢核。
+
+命令行同样一套:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/export_lerobot_dataset.py --list-tasks
+PYTHONPATH=src .venv/bin/python scripts/export_lerobot_dataset.py --task "牛牛抓放" --dry-run
+PYTHONPATH=src .venv/bin/python scripts/export_lerobot_dataset.py --task "牛牛抓放" \
+    --repo-id so_snake/niuniu_pick_place --out data/lerobot/niuniu_pick_place
+```
+
+**按 task 标签选**,一次导一个技能 —— 一个 store 里放着几种任务,混着训出来的策略学的
+是它们的平均。`--dry-run` 走完除了解码和写盘之外的全部流程(筛选、测帧率、算动作统计),
+先跑它:一条 take 视频对不齐,在这里发现最便宜。
+
+### 映射:绝对 5D 流形位姿 → 同一张图上的增量
+
+是的,现在就是这个。两边都活在 `so_snake.m3_safety.task_pose` 定义的**同一张图**
+`(x, y, z, pitch, roll)` 上,数据集里不出现 SE(3)、四元数或旋转矩阵。
+
+记 `q_t` 为总线读回的关节角,`Φ` 为进入这张图的正向映射(FK + 解析到图坐标,
+`TaskIK5D.task_pose`):
+
+```
+p_t = Φ(q_t)                   臂实际到达的 5D 位姿
+c_t = action.task.target[t]    回路当时下发的 5D 目标
+
+state[t]  = ( p_t ,  g_t 实测 )
+action[t] = ( c_t ⊖ p_{t-1} ,  g_t 指令 )
+```
+
+**更新公式**(rollout 每步跑的那个逆):
+
+```
+c_t = p_{t-1} ⊕ action[t][0:5]
+g_t = action[t][5]
+```
+
+`⊕` / `⊖` 逐分量作用,只在两个角度分量上和普通加减不同:
+
+```
+(a ⊕ b)_i = a_i + b_i             i ∈ {x, y, z}       米
+(a ⊕ b)_i = wrap( a_i + b_i )     i ∈ {pitch, roll}   弧度
+(a ⊖ b)_i = a_i − b_i             i ∈ {x, y, z}
+(a ⊖ b)_i = wrap( a_i − b_i )     i ∈ {pitch, roll}
+
+wrap(θ) = (θ + π) mod 2π − π      折进 (−π, π]
+```
+
+真机 rollout 时 `p_{t-1}` **不是从数据集读的,是当场测的**:
+
+```
+c_t = Φ( q_实测 ) ⊕ π_θ(观测)[0:5]
+```
+
+这正是锚点选「到达位姿」的全部理由。`⊕` 只有一份实现 ——
+`so_snake/data/export.py` 里的 `apply_action`,训练和 rollout 因此不可能对不上。
+
+三点刻意不是:
+
+* **不是切空间/指数映射的步长。**`⊖` 就是图坐标的直接差,不是李代数 log。这里成立,
+  是因为这张图在臂能到的地方处处正则 —— `psi` 是**位置**的函数而不是工具自身方位角的
+  函数,就是为了夹爪垂直向下时不退化(见 `task_pose.py`)。单步位移很小,图在这个尺度
+  上光滑,坐标差和真正的测地步长的差别远小于伺服滞后。
+* **夹爪不是增量。**action 里是绝对角,state 里是**实测角**,故意是两个数。在第一条
+  format v2 take 上实测两者最大差 **10.2°** —— 夹爪堵在物体上,指令角看不出来。
+* **锚点不是上一条指令。**是 `p_{t-1}` 不是 `c_{t-1}`,这条的理由见
+  [`docs/act_baseline.md`](docs/act_baseline.md)(「整步零动作」占比 25% → 0.1%)。
+
+单位是米 / 弧度 / 度混在同一个向量里 —— 难看,但故意:这是本仓其它每一层已经在用的
+单位,数据集偷偷换算会让所有打印出来的诊断和真臂对不上。
+
+实测校验(`ep_20260812_213956`,552 行):`state[:, :5] == Φ(q_实测)` 与
+`action[:, :5] == c_t ⊖ p_{t-1}` 精确成立,`p_{t-1} ⊕ action[t]` 还原 `c_t` 误差
+**1.8e-7**(float32 存储)。每次导出都会重跑这个检查,见下。
+
+### 导出的数据可回放,而且是验过的
+
+写完不等于能用。**写盘那一刻,所有致命故障看起来都像成功**:parquet 页脚没写(原来根本
+没调 `LeRobotDataset.finalize()`,官方注释写明「不调就加载不了」)、某路视频少一帧、
+时间轴按一个谁也没跑过的帧率生成。这些只有**把盘上的东西读回来**才看得见。
+
+所以导出默认跟一次读回校验(GUI 里自动跑,CLI 里 `--no-verify` 才关掉),它重新打开
+parquet、manifest 和 mp4,问三件事:
+
+1. **行还是那些行吗** —— 盘上的 state/action 对比源 episode 现算一遍;
+2. **还能反解吗** —— 用 `apply_action` 把盘上的行还原成当初下发的 5D target。这是
+   rollout 依赖的那条契约,也是「可回放」和「能读」的区别;
+3. **时间轴是真的吗** —— timestamp 对 `frame_index / fps`,以及每行每路各有一帧可解码
+   的视频。
+
+实测一份 1672 行的导出:target 还原误差 **0.010 µm / 12 µdeg**(float32 舍入,不是
+契约误差),timestamp 与栅格差 **0.9 µs**,两路视频各 1672 帧 = 1672 行。把其中一路
+视频截到 500 帧,校验立刻判 **NOT REPLAYABLE**。
+
+每份导出还会在数据集根目录写一个 `export.json`,按数据集 episode 顺序记下源 take 的
+id —— lerobot 的元数据没地方放这个,没有它导出就是一扇单向门:没法核对、没法重导、
+也没法告诉操作者该回去补录哪一条。
+
+**真的放到臂上回放:**
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/replay_lerobot_dataset.py \
+    --dataset data/lerobot/niuniu_pick_place --list
+PYTHONPATH=src .venv/bin/python scripts/replay_lerobot_dataset.py \
+    --dataset data/lerobot/niuniu_pick_place --episode 0 --backend mujoco
+```
+
+它把导出的一条 episode 还原成和录制 take 一样的 `Episode`,交给**同一个**
+`EpisodeReplayer` 播 —— 同样的限速趋近、同样的 deg/s 钳位、同样的关节限位、同样的网格
+离地检查,安全层一行都没有复制。只有 task 模式:数据集刻意不带关节流(策略是在任务空间
+训的),关节由今天的 IK 从 target 解出来,这本来就是 task 模式在做的事。实测一条 558 步
+的导出 episode 在 mock 上跑完:任务位置误差 p95 **0.0034 mm**,IK 收敛 99.1%。
+
+录制格式是刻意冗余的(三条动作流都存),训练集则必须挑一个。三个选择都是数据逼出来的,
+决策记录见 [`docs/act_baseline.md`](docs/act_baseline.md)(含实测证据、M1 训练实测数据、
+以及明天从哪接着做),代码里的理由写在
+[`src/so_snake/data/export.py`](src/so_snake/data/export.py) 的模块头:
+
+**state 用臂真正到达的位姿,不是它被要求到达的。**`observation.state.task_pose` 名字
+像观测但不是:它是 **IK 解**的正运动学,所以它和 `action.task.target` 的距离是解算残差
+—— 本机实测 1e-6。臂离目标的真实距离比这大三个数量级:**中位 9.6 mm、p95 41 mm、
+p95 pitch 10°**,全是负载下的伺服滞后。导出时用
+`FK(observation.state.joints_deg)` 现算,这才是能报告舵机堵转、物体脱手、碰撞的那一路。
+
+**action 是从「到达的位姿」起步的增量,不是从上一条指令起步的。**增量必须锚在某个东西
+上,锚在哪里决定误差会不会累积:锚在上一个 *target* 上,策略就是个开环积分器,系统性
+低估会一路走掉再也回不来;锚在**到达的位姿**上,每一步都重新参考测量值,rollout 自己
+纠正自己。
+
+    action[t] = target[t] - FK(measured joints)[t-1]
+    rollout:   target = FK(measured now) + action
+
+两边带着同一份伺服滞后,策略于是复现遥操作指令原本带的那个提前量。**滞后比单步位移
+还大**是这件事在这台臂上要紧的原因:p95 上滞后贡献 41 mm、操作者意图只有 5 mm,忽略
+它不是小近似。实测也印证了:锚在测量值上,「整步零动作」的比例从 25% 掉到 **0.1%**。
+
+`--action-space absolute` 导出 `target[t]` 本身,作对照组 —— delta 的 rollout 要是漂了,
+它回答漂移是不是动作空间造成的。夹爪两种模式下都是绝对角(实测只在 2° 和 90° 两个值
+之间跳,delta 会让它整条 episode 预测零、然后要求它精确命中一次 88° 跃变)。
+
+**帧率是量出来的,不是从配置读的。**已有的 43 条 take,回路配的是 30 Hz,实际跑
+26.3 Hz(成因和修复见下面「回路频率」),而录制把**配置值**写进了 mp4 头,所以视频声称
+比它记录的 take 短 15%。按配置值导出会训出一个动作块横跨 3.3 s 意图、却在 2.9 s 墙钟里
+放完的策略 —— 比它学过的每一条示范都快 15%,而这条臂的跟踪滞后本来就是动作里最大的
+一项。所以帧率取 `n_steps / duration_s` 的**中位数**(中位而非均值:一条跑飞的 take
+应该被筛掉,而不是把全体的时间栅格拽走),视频**按帧号**读出来再按这个帧率重编码 ——
+这同时消掉了头信息里的那个谎,lerobot 是按时间戳 seek 这些文件的,头和行栅格对不上不是
+外观问题。
+
+回路修好之后新录的 take 会是 30 Hz,但**帧率照样量**:26 Hz 的旧 take 和 30 Hz 的新
+take 差 15%,放不进同一条时间栅格,而这正是筛选要拦下来的事(`fps_tolerance` 默认 8%,
+所以混选会被自动拒掉,不会静悄悄训出一个半快半慢的数据集)。**这两批要分开导。**
+
+实测导出:43 条 `牛牛抓放` take 里 41 条可用 / 20043 帧 / 26 Hz,各 take
+25.84–26.42 Hz,**与 26 Hz 最大偏差 1.6%**;另 2 条缺第三人称相机,导出时拒绝。
+
+### 在 MacBook Pro M1 上训练
+
+**可以,实测跑得动。**ACT(ResNet18 ×2 相机,52M 参数)在 M1 Pro / 16 GB 上用 MPS:
+
+| 分辨率 | 训练一步 | 20k 步 | 100k 步 | 冷启动一次推理 |
+|---|---|---|---|---|
+| 240×320 | **304 ms** | **1.7 h** | 8.4 h | 22 ms |
+| 360×480 | 593 ms | 3.3 h | 16.5 h | 36 ms |
+| 480×640 | 953 ms | 5.3 h | 26.5 h | 56 ms |
+
+导出默认 **240×320**,因为 26 Hz 的控制周期是 38 ms,而 ACT 每 `n_action_steps` 步要
+重新规划一次整块:480×640 的 56 ms 塞不进一个周期,240×320 的 22 ms 塞得进。真实训练
+实测 316 ms/步(`updt_s 0.313`、`data_s 0.005`),两路视频的解码被 dataloader 完全
+overlap 掉了,不是瓶颈;显存约 1 GB。
+
+```bash
+HF_LEROBOT_HOME=data/lerobot .venv/bin/lerobot-train \
+    --dataset.repo_id=so_snake/niuniu_pick_place \
+    --dataset.root=data/lerobot/niuniu_pick_place \
+    --policy.type=act --policy.device=mps --policy.push_to_hub=false \
+    --output_dir=outputs/act_niuniu --steps=20000 --batch_size=8
+```
+
 ## Web GUI
 
 ```bash
@@ -252,6 +541,34 @@ lerobot 的硬依赖,真机路径上本来就有),读帧是非阻塞 peek,实测
 种枚举给出三种顺序,任何按位置推出来的名字都是猜的,而猜错是静默的(内置摄像头和 USB
 相机都是 1080p、都正常出帧)。细节见
 [`tools/gui/README.md`](tools/gui/README.md) 的「真实相机」一节。
+
+#### 「扫描不出腕部相机」通常不是没扫到
+
+腕部相机**在列表里**,只是那张缩略图什么都看不出来,于是在一排五个里被当成没扫到。
+本机实测:它开得了、出 1920×1080、曝光正常(**对比度 69,和其它设备一样健康**),
+只是拉普拉斯方差只有 **4.3**,而同型号的第三人称那台是 **128**。
+
+**这不是故障。**腕部相机对焦在**夹爪距离**上 —— 那是它唯一有用的距离,策略要看的是
+夹爪合拢时的物体,不是房间另一头。面前没东西的时候它拍到的就是一片糊,这是镜头在
+干它该干的活。所以:
+
+* **失焦不阻止任何事。**开相机、录制、导出,没有一条路径会因为这个数值拒绝设备 ——
+  代码里从来没有过这样的门,也不会加。
+* 扫描测这个数值,是为了回答扫描本来要回答的问题:**这张缩略图是哪台相机**。细节太少
+  的图在一排五个里看着像空位,操作者就会以为它没扫到。
+* 所以列表里只标一个中性的 `·`、边框改虚线,横幅用蓝色写「有 N 个相机画面细节很少,
+  不好按图认 —— 它们**在**列表里,能选也能录」,并附一句:腕部相机本来就该是糊的,
+  不用去拧镜头。想确认是哪台,**把手放到镜头前几厘米再扫一次**。
+
+(早先这里写的是「拧对焦环」,那是错的 —— 照做会把一台设置正确的相机弄坏。)
+
+锁屏的 iPhone(Continuity Camera)会被单独判成「画面全黑」(对比度≈0),和细节少
+是两回事,但同样不阻止任何事。
+
+顺带修掉一个静默的坑:GUI 里「隐藏这个设备」原来按 **index** 存在 localStorage 里,
+而 macOS 的 index 会挪位 —— 曾经把 index 2 当内置摄像头隐藏掉,重插之后 index 2 变成
+腕部相机,它就**真的从列表里消失了**,操作者还在找一个界面故意不显示的相机。现在隐藏
+记录会连同当时的设备指纹一起存,设备一变就整份作废并提示,宁可多点一次也不能藏错。
 
 仿真相机预览要能渲染。启动时会打出选了哪个 GL 后端(egl → glfw → osmesa,子进程里
 真渲染一帧决定),`MUJOCO_GL` 已 export 则跳过探测。撞到 `EGLDeviceEXT` 报错、或者
@@ -296,7 +613,19 @@ clutch 即停(无运动尾巴)、夹爪可控、退出卸力。真机接入的�
 - [x] **真实 USB 双相机接入 GUI**:按缩略图指派视角(编号不可信,见上)、两路实时预览优先于仿真相机;采集在 lerobot 线程上,读帧 0.0014 ms,回路无损
 - [x] **相机帧写入 episode**:每个视角一个 mp4,编码在独立线程上,每控制步一帧保证 video 帧 i == npz 行 i;编码器按机器探测选(缺 CPU 用硬编,缺磁盘用软编),选中结果与理由写进 `meta.json`
 - [x] **数据集页双路视频回看**:两路相机与轨迹曲线共用游标,按帧号对齐(不是时间戳 —— 实测 19.2 s 的 take 视频文件只有 16.7 s,按时间对齐片尾会差 2.5 s)
-- [ ] LeRobotDataset 导出
+- [x] **修掉第二路相机的「跳帧播放」**:第二路从来没人调过 `play()`,它只靠 `onTimeUpdate` 里的 seek 前进,而浏览器把 `timeupdate` 限到 ~4 Hz —— 于是主画面 30 fps、腕部画面 4 fps 一顿一顿。现在第二路跟随第一路的 play/pause/seek/倍速,帧号校正只是校正
+- [x] **修掉帧号「1, 9, 17」跳着走**:同一个 `timeupdate` 4 Hz 的根因 —— 30 fps ÷ 4 Hz = 每次跳 ~8 帧。`currentTime` 本身是连续的,粗的只是事件,所以改成播放时用 `requestAnimationFrame` 采样,索引变了才回调。配套把 `SeriesPlot` 里按样本数计费的部分(1200 点 path 字符串 ×5 图)`useMemo` 掉,否则光标每帧移动会重建它们
+- [x] **LeRobotDataset 导出**:按 task 选、5D manifold state + manifold 增量 action(锚在测量位姿上,所以 rollout 自纠)、帧率量出来而不是读配置(rollout 与示范同速,偏差 1.6%)、两路相机;**GUI 里一个按钮**(试算 → 后台导出 → 可取消),臂在动时拒绝
+- [x] **导出后读回校验,证明可回放**:重新打开盘上的 parquet/manifest/mp4,查行是否一致、`apply_action` 是否还能反解出当初的 5D target、每行每路是否各有一帧。实测 1672 行还原误差 0.010 µm、时间轴差 0.9 µs;顺带发现原来**从没调过 `LeRobotDataset.finalize()`**(不调 parquet 页脚不写,数据集加载不了)
+- [x] **导出的数据能真的放回臂上**:`scripts/replay_lerobot_dataset.py` 把导出 episode 还原成 `Episode`,交给同一个 `EpisodeReplayer`(安全层零复制)。558 步实测跑完,任务位置误差 p95 0.0034 mm
+- [x] **回路真的跑到 30 Hz**(原来 26.3):不是活慢(每步 ≈5 ms),是 `time.sleep` 在 macOS 上多睡 4 ms,且旧代码从迭代开头算剩余把每次超时都永久记账。改成递推绝对 deadline + 6 ms 自旋尾,补偿封顶一个周期。回放同步修(原来两个 bug 互相抵消)
+- [x] **帧率改按「步周期中位数」测**,不再用 `n_steps / duration_s`:按录制键会触发一次 ~700 ms 的编码器探测,一条 292 步的 take 里这一步就把均值从 30.1 拽到 28.2(0.3% 的步造成 6% 的误差)。探测结果现在缓存并在开会话时预热,按下录制的代价从 678 ms 降到 0.05 ms
+- [x] **录制补上夹爪实测角**(format v2):总线本来就读到了,v1 把它切掉了 —— 指令角看不出夹爪堵在物体上
+- [x] **M1 Pro 上 ACT 训练实测可行**:240×320 双相机 316 ms/步,20k 步 1.7 h
+- [x] **给未标注的 33 条打 task 标签**:`牛牛抓放` 现在共 43 条,其中 41 条能过筛 = 20043 帧 ≈ 12.9 分钟;另 2 条缺第三人称相机
+- [x] **细节少的相机不再被当成「没扫到」**:扫描测细节量,把这类设备标出来而不是藏起来(腕部那台实测 4.3 vs 同型号 128)。**不阻止任何事** —— 腕部相机对焦在夹爪距离上,静止时本来就糊,这是对的;标注只为了在一排缩略图里认出它是谁。隐藏记录连设备指纹一起存,插拔后作废
+- [ ] rollout 执行器(策略 → 5D target → 现有 atlas/IK/限速安全层 → 真臂)
+- [ ] 补录到 ~50 条并变化物体位置(现有 41 条可训 take / 20043 帧 ≈ 12.9 分钟,还缺位置变化与真机 rollout 验证)
 - [ ] **待精修**:TCP 实测校准、offset 精修(标定欠扫的 pan/wrist_flex)、clutch/atlas 手感调参、相机外参
 
 ### 5 维任务空间迁移
@@ -325,6 +654,7 @@ scripts/               可复现的分析与验证脚本
 src/so_snake/          M0~M5 模块实现
 tools/gui/frontend/    Web GUI 前端(React + Vite;后端在 src/so_snake/gui/)
 data/episodes/         录制的 episode(不入版本库)
+data/lerobot/          导出的 LeRobotDataset(不入版本库)
 ```
 
 `assets/so100_*.json` 是**这台臂**的标定/记录产物(舵机装配相关),换臂或重标定需重新生成。
@@ -339,6 +669,8 @@ data/episodes/         录制的 episode(不入版本库)
 | `scripts/serve_gui.py` | 本机 Web GUI(遥操作 / 录制 / 回放 / 进度) | 否 |
 | `scripts/record_episode.py` | 录制一条 episode 到 `data/episodes/` | 视 backend |
 | `scripts/replay_episode.py` | 回放 episode(`--check` 只检查不动) | 视 backend |
+| `scripts/export_lerobot_dataset.py` | 按 task 导出 `LeRobotDataset`(`--dry-run` 只筛选不写,`--verify` 只校验已有数据集) | 否(需 lerobot) |
+| `scripts/replay_lerobot_dataset.py` | 把导出的数据集放回臂上(`--check` 只检查不动) | 视 backend(需 lerobot) |
 | `scripts/check_kinematics_agreement.py` | ArmChain / placo / MuJoCo 三方 FK/Jacobian 互校 | 否 |
 | `scripts/check_teleop_loop.py` | MockFollower + ScriptedSource 默认闭环 Gate | 否 |
 | `scripts/check_kinematics.py` | 旧 FK/IK round-trip 验证(待归档) | 否 |

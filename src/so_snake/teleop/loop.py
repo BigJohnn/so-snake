@@ -38,6 +38,7 @@ from ..m3_safety.ik5d import TaskIK5D
 from ..m3_safety.projection import OrientationProjector
 from ..m3_safety.task_pose import SO100TaskPose, TaskFrame, TaskPoseTracker, wrap_to_pi
 from ..m4_execution.backends import RobotBackend
+from ..pacing import RateKeeper
 from .clutch import ClutchRetargeter
 from .sources import NintendoProSample, TeleopSource
 
@@ -65,6 +66,11 @@ class StepRecord:
     achieved_task_pose: np.ndarray  # (5,)
     achieved_position: np.ndarray  # (3,)
     achieved_quaternion: np.ndarray  # (4,) full 6-DoF pose is kept, deliberately
+    # The gripper as the bus reports it, not as it was asked for. The two part
+    # company exactly when it matters: closing on an object stalls the servo
+    # short of the commanded angle, and that gap is the only proprioceptive
+    # evidence that something is held. `gripper_cmd_deg` cannot show it.
+    measured_gripper_deg: float
 
     # M3 diagnostics — the plan's `orientation_projection_feedback`, demoted out
     # of the control loop but still logged.
@@ -244,8 +250,6 @@ class TeleopLoop:
                 that was not also logged. A GUI stop button lives here; the
                 source's own "stop" event is unchanged and still honoured.
         """
-        period = 1.0 / self.config.teleop.control_hz
-
         if not self.backend.is_connected:
             self.backend.connect()
         if not self.source.is_connected:
@@ -258,10 +262,13 @@ class TeleopLoop:
         clutch_prev = False
         t_start = time.perf_counter()
         t_prev = t_start
+        # Holds `control_hz` for real; `time.sleep` on its own does not, and the
+        # 4 ms it overshoots by is why this loop used to record at 26 Hz against
+        # a configured 30. See `so_snake.pacing`.
+        keeper = RateKeeper(self.config.teleop.control_hz, enabled=realtime, now=t_start)
         step = 0
 
         while max_steps is None or step < max_steps:
-            t_loop = time.perf_counter()
             if should_continue is not None and not should_continue():
                 break
             sample: NintendoProSample = self.source.read()
@@ -404,6 +411,7 @@ class TeleopLoop:
                 achieved_task_pose=achieved.as_array(),
                 achieved_position=achieved_pose_world[:3, 3],
                 achieved_quaternion=_rotation_to_quaternion(achieved_pose_world[:3, :3]),
+                measured_gripper_deg=float(measured[self._n_arm]),
                 ik_position_error_m=position_error_m,
                 ik_pitch_error_rad=pitch_error_rad,
                 ik_roll_error_rad=roll_error_rad,
@@ -435,10 +443,7 @@ class TeleopLoop:
             t_prev = now
             step += 1
 
-            if realtime:
-                slack = period - (time.perf_counter() - t_loop)
-                if slack > 0:
-                    time.sleep(slack)
+            keeper.wait()
 
         return self.stats
 

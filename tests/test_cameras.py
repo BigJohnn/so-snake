@@ -224,3 +224,144 @@ def test_devices_are_listed_without_invented_names(monkeypatch):
     assert [d["index"] for d in devices] == [0, 1]
     assert all(d["name"] == "" for d in devices)
     assert all(d["thumbnail"].startswith("data:image/jpeg;base64,") for d in devices)
+
+
+# --------------------------------------------- present but hard to identify
+
+
+def _fake_cv2_capture(monkeypatch, frames: dict[int, np.ndarray]):
+    """Make `cv2.VideoCapture(i)` hand back `frames[i]`, or fail to open."""
+    import so_snake.m0_perception.cameras as mod
+
+    class FakeCapture:
+        def __init__(self, index):
+            self.index = index
+
+        def isOpened(self):  # noqa: N802 - cv2 API
+            return self.index in frames
+
+        def read(self):
+            frame = frames.get(self.index)
+            return frame is not None, frame
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+    import cv2
+
+    monkeypatch.setattr(cv2, "VideoCapture", FakeCapture)
+    return mod
+
+
+def _sharp_frame(seed: int = 0) -> np.ndarray:
+    """High-frequency noise: what an in-focus camera's frame looks like."""
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 256, size=(240, 320, 3), dtype=np.uint8)
+
+
+def _low_detail_frame() -> np.ndarray:
+    """A smooth gradient: detail-free, but with plenty of contrast.
+
+    That combination is the point, and it is what a correctly set up wrist
+    camera looks like at rest: focused at gripper distance, so with nothing in
+    front of it the picture is a blurred field with a healthy contrast of 69.
+    Exposure checks see nothing wrong -- rightly -- and only a detail measure
+    can tell the operator which thumbnail this is.
+    """
+    ramp = np.linspace(0, 255, 320, dtype=np.float64)
+    return np.repeat(np.tile(ramp, (240, 1))[:, :, None], 3, axis=2).astype(np.uint8)
+
+
+def test_a_low_detail_camera_is_listed_and_noted_not_dropped(monkeypatch):
+    """The thing that reads as "the camera did not show up".
+
+    A near-focused camera opens, streams and delivers correctly exposed frames,
+    so every check the scan makes passes -- and its thumbnail is a smear the
+    operator reads as an absent device. It has to stay in the list and be
+    selectable, and the note has to say which device it is rather than claiming
+    a fault: for the wrist role this picture is the expected one.
+    """
+    mod = _fake_cv2_capture(monkeypatch, {0: _sharp_frame(), 1: _low_detail_frame()})
+
+    scan = mod.scan_devices(max_index=3, thumbnails=False)
+    devices = {d["index"]: d for d in scan["devices"]}
+
+    assert set(devices) == {0, 1}, "the low-detail camera must still be listed"
+    assert devices[0]["note"] == ""
+    assert "little detail" in devices[1]["note"]
+    assert devices[1]["sharpness"] < mod.LOW_DETAIL_LAPLACIAN_VAR
+    # Healthy contrast is exactly why an exposure check sees nothing wrong.
+    assert devices[1]["contrast"] > mod.BLANK_CONTRAST_STD
+
+    # Named, not condemned: the note must not tell the operator to go and
+    # adjust a lens that is set correctly for its job.
+    assert "wrist camera at rest" in devices[1]["note"]
+    assert "focus ring" not in devices[1]["note"]
+
+    assert [u["index"] for u in scan["diagnostics"]["hard_to_identify"]] == [1]
+
+
+def test_a_blank_camera_is_reported_as_blank_not_as_low_detail(monkeypatch):
+    """A locked iPhone on Continuity Camera streams black forever."""
+    mod = _fake_cv2_capture(
+        monkeypatch, {0: _sharp_frame(), 1: np.zeros((240, 320, 3), dtype=np.uint8)}
+    )
+
+    devices = {d["index"]: d for d in mod.scan_devices(max_index=3, thumbnails=False)["devices"]}
+
+    assert "no picture" in devices[1]["note"]
+    assert devices[1]["contrast"] < mod.BLANK_CONTRAST_STD
+
+
+def test_the_scan_explains_an_empty_result(monkeypatch):
+    """No devices is not a state the operator can act on without a reason."""
+    mod = _fake_cv2_capture(monkeypatch, {})
+
+    scan = mod.scan_devices(max_index=3, thumbnails=False)
+
+    assert scan["devices"] == []
+    assert "permission" in scan["diagnostics"]["permission_hint"].lower()
+    assert scan["diagnostics"]["attempted"] == 3
+    assert len(scan["diagnostics"]["failures"]) == 3
+
+
+def test_list_devices_still_returns_only_devices(monkeypatch):
+    """The old signature keeps working for callers that want no diagnostics."""
+    mod = _fake_cv2_capture(monkeypatch, {0: _sharp_frame()})
+
+    devices = mod.list_devices(max_index=2, thumbnails=False)
+    assert isinstance(devices, list)
+    assert [d["index"] for d in devices] == [0]
+
+
+def test_a_low_detail_camera_can_still_be_opened_and_recorded(monkeypatch):
+    """The note is advisory. Nothing in the pipeline may refuse on it.
+
+    The wrist camera is focused at gripper distance -- it is *only* sharp when
+    something is close, which is exactly when the policy needs it. A picture
+    that looks flat while the arm sits at rest is the normal state of a working
+    camera, so refusing to open or record it would refuse the correct setup.
+    """
+    mod = _fake_cv2_capture(monkeypatch, {0: _sharp_frame(), 1: _low_detail_frame()})
+    devices = {d["index"]: d for d in mod.scan_devices(max_index=3, thumbnails=False)["devices"]}
+    assert devices[1]["note"], "precondition: this device is the low-detail one"
+
+    # The rig opens it like any other: a spec built from the scanned device
+    # validates, connects, and delivers frames.
+    opened: list[str] = []
+
+    def fake_open(spec):
+        opened.append(spec.role)
+        return FakeCamera(np.zeros((4, 4, 3), dtype=np.uint8))
+
+    rig = CameraRig(
+        (CameraSpec(role="wrist", index_or_path=devices[1]["device"]),),
+        open_camera=fake_open,
+    )
+    rig.connect()
+
+    assert opened == ["wrist"]
+    assert rig.is_connected
+    assert rig.read_latest("wrist") is not None
+    rig.disconnect()

@@ -186,6 +186,25 @@ td.num, th.num { font-family: var(--mono); text-align: right; }
 .banner.error { background: #2a1214; border-color: #5a2020; color: #ffc9c9; }
 .banner.warn { background: #241d0d; border-color: #4a3a17; color: #f0d79a; }
 .banner.info { background: #0f2233; border-color: var(--accent-dim); color: #cfe4f7; }
+.banner.ok { background: #10240f; border-color: #23491f; color: #b9e8b3; }
+
+/* Export panel ---------------------------------------------------------- */
+.export-progress, .export-plan, .export-report { margin-top: 14px; display: grid; gap: 10px; }
+.export-progress progress { flex: 1; height: 6px; }
+.export-log {
+  max-height: 220px; overflow: auto; margin: 0; padding: 10px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius);
+  font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: pre-wrap;
+}
+.export-skipped summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+ul.tight { margin: 6px 0 0; padding-left: 18px; }
+ul.tight li { margin: 2px 0; }
+
+/* A camera whose picture carries little detail. Marked, not dimmed and not
+   coloured like a fault: a wrist camera focused at gripper distance looks like
+   this at rest and is working exactly as intended. The mark exists so the
+   thumbnail is not mistaken for an empty slot. */
+.camera-choice.low-detail { border-style: dashed; }
 
 .preview { position: relative; background: #000; border-radius: 6px; overflow: hidden; line-height: 0; }
 .preview img { width: 100%; display: block; }
