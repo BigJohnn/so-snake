@@ -229,7 +229,10 @@ function DatasetRow({
         ) : (
           <span className="dim">无 manifest</span>
         )}
-        <span className="when">{shortTime(dataset.modified)}</span>
+        {/* `modified` is epoch *seconds*, as Python hands it over; shortTime
+            takes milliseconds. Without the conversion every dataset in the
+            library was stamped 01-21, which is 1970 plus 20-odd days. */}
+        <span className="when">{shortTime(dataset.modified * 1000)}</span>
       </div>
     </button>
   );
@@ -532,10 +535,12 @@ function DatasetDetail({
  *    so the operator does not see a half-written verdict.
  *  * "未校验" is a state, not a missing button: a freshly exported dataset is
  *    verified by default, but one that predates this page was not.
- *  * "校验过 / 部分" is the no-manifest case: round-trip + time axis pass,
- *    source-fidelity is recorded in `skipped`. Treated as `warn`, not `ok`,
- *    because "the parquet reads back" is not the same claim as "the parquet
- *    matches the source".
+ *  * "校验过 / 部分" is the missing-input case: round-trip + time axis pass and
+ *    source-fidelity is recorded in `skipped`, either because there is no
+ *    manifest to map episodes to takes or because a take has since been deleted
+ *    from the store. Treated as `warn`, not `ok`, because "the parquet reads
+ *    back" is not the same claim as "the parquet matches the source" -- and not
+ *    as `error`, because neither absence changes a byte of the dataset.
  *  * "校验过 / 失败" shows the cached answer plus the staleness flag, because
  *    a dataset re-exported in place would otherwise stay green over changed
  *    bytes. */
@@ -586,8 +591,9 @@ function VerdictPanel({
       <Banner tone={tone}>{headline}</Banner>
       {verdict.stale ? (
         <Banner tone="warn">
-          数据集在 <span className="mono">{shortTime(verdict.verified_at * 1000)}</span> 之后被改过,
-          缓存的校验结果不再可信 —— 重新校验一次。
+          这份结果校验于 <span className="mono">{shortTime(verdict.verified_at * 1000)}</span>,
+          数据集在 <span className="mono">{shortTime(verdict.dataset_mtime * 1000)}</span> 又被写过 ——
+          缓存的校验结果不再可信,重新校验一次。
         </Banner>
       ) : null}
       {isPartial ? (
@@ -598,10 +604,20 @@ function VerdictPanel({
               <li key={i}>{note}</li>
             ))}
           </ul>
-          重新导出(覆盖同名数据集)后会写一份 source mapping,下一次校验就是完整的。
+          源 take 还在的话,重新导出(覆盖同名数据集)会补上 source mapping,下一次校验就是完整的;
+          take 已经删了的话,这份数据集就只能这样了 —— 照样能训,只是再也没法和当时的录制对账。
         </Banner>
       ) : null}
       <div className="stats">
+        {/* Coverage first, because it qualifies every number after it: the误差
+            columns are maxima over the episodes that were compared, and "0.00e+0
+            over 0 of 1 集" is not the same claim as "0.00e+0 over 1 of 1". */}
+        <Stat
+          label="源比对"
+          value={`${verdict.episodes_compared}/${verdict.n_episodes}`}
+          unit="集"
+          small
+        />
         <Stat label="状态误差" value={fmt(verdict.state_max_abs_error)} small />
         <Stat label="动作误差" value={fmt(verdict.action_max_abs_error)} small />
         <Stat
@@ -671,13 +687,26 @@ function verdictBadge(dataset: DatasetMeta): "ok" | "warn" | "danger" | "neutral
 
 /** mtime is seconds-since-epoch on the wire, Date wants milliseconds. The
  *  caller hands us either; this normalises. */
+/** A wall-clock stamp for the operator: `HH:MM` today, `MM-DD` before that.
+ *
+ * Local time, not UTC. Every number this formats is compared against a clock
+ * on the wall of the room the arm is in -- "the dataset changed at 14:36" is
+ * only useful if 14:36 is when the operator was standing there. `toISOString`
+ * was doing the formatting before, so a take exported at 22:36 read as 14:36,
+ * and "today" flipped eight hours early. Takes milliseconds, like `Date`. */
 function shortTime(value: number | string): string {
   const ms = typeof value === "string" ? Date.parse(value) : value;
   if (!Number.isFinite(ms)) return "—";
   const date = new Date(ms);
-  const today = new Date().toISOString().slice(0, 10);
-  const stamp = date.toISOString();
-  return stamp.slice(0, 10) === today ? stamp.slice(11, 16) : stamp.slice(5, 10);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  return sameDay
+    ? `${pad(date.getHours())}:${pad(date.getMinutes())}`
+    : `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 function fmt(value: number | undefined): string {

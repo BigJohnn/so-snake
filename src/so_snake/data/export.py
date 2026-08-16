@@ -777,6 +777,12 @@ class VerifyReport:
     action_space: str
     n_episodes: int = 0
     n_frames: int = 0
+    # How many episodes were actually compared against their source take. Fewer
+    # than `n_episodes` means the error figures below cover only part of the
+    # dataset, and every gap is named in `skipped`. Without this the numbers read
+    # as whole-dataset claims: one comparable episode out of fifty reports the
+    # same "0.00e+0" as fifty out of fifty.
+    episodes_compared: int = 0
     # Worst disagreement between the rows on disk and the rows recomputed from
     # the source episodes. Non-zero by construction -- the dataset is float32
     # and the recording is float64 -- so what matters is the magnitude.
@@ -789,13 +795,14 @@ class VerifyReport:
     gripper_error_max_deg: float = 0.0
     timestamp_max_error_s: float = 0.0
     video_frames: dict[str, int] = field(default_factory=dict)
-    # Failures: things that should be true about a usable dataset and are not.
-    # `ok` is False iff this list is non-empty.
+    # Failures: a check ran against a reference and the dataset disagreed with
+    # it. `ok` is False iff this list is non-empty.
     issues: list[str] = field(default_factory=list)
-    # Things we deliberately did not check, because the inputs weren't there
-    # (no manifest, no episode store). Not failures -- the dataset can still
-    # be replayed -- but the operator should know so a green `ok` is not
-    # read as "checked against source takes".
+    # Checks that could not run, because an input that lives outside the dataset
+    # was not there (no manifest, no episode store, a source take since deleted).
+    # Not failures -- nothing was learned about the dataset either way -- but the
+    # operator must know, so a green `ok` is not read as "checked against source
+    # takes". See `verify` for why the line falls here.
     skipped: list[str] = field(default_factory=list)
 
     @property
@@ -841,13 +848,35 @@ def verify(
     ran at. Pass `store=None` to check only what the dataset can check about
     itself.
 
+    ## Failure versus gap, which is the whole of `issues` versus `skipped`
+
+    An `issue` is a check that ran and the dataset lost: the rows disagree with
+    the recording, the timestamps disagree with `frame_index / fps`, the manifest
+    disagrees with the parquet about how many episodes there are. Every reference
+    in that list lives *inside* the dataset or is the arithmetic the format
+    defines, so a disagreement is a defect of these bytes and blocks training.
+
+    A `skipped` entry is a check that could not run because something outside the
+    dataset was absent: no `export.json`, no episode store, or a source take that
+    has since been deleted from the store. Nothing was learned, and nothing is
+    wrong with the dataset -- deleting a take does not change a byte of it. This
+    is the reason the line falls exactly here rather than at "we could not
+    confirm it, so refuse it": a verdict that turns red because a *different*
+    directory changed is not a statement about the dataset at all, and the same
+    export would then verify green on the bench that still holds the takes and
+    red on the training box that never had them. A verdict has to be a property
+    of the artefact under test to be worth citing about it.
+
+    So a dataset whose takes are gone reads PARTIAL, not FAILED -- amber, with
+    every unresolvable episode named, and `episodes_compared` saying how much of
+    the dataset the error figures actually cover. It is trainable; what is lost
+    is the ability to audit it against the recording, or to export it again.
     A dataset without our `export.json` (foreign, legacy, or wiped by hand) is
-    still partially verifiable: the parquet round-trip, the time axis and the
-    video frame counts run regardless, because they need only the parquet.
-    Source-fidelity (the rows against the operator's recordings) cannot run
-    without the source mapping and is skipped; the report says so and is *not*
-    marked `ok` just because the round-trip passes -- "no source comparison" is
-    a different answer from "source comparison passed".
+    the same case arrived at from the other end: the parquet round-trip, the time
+    axis and the video frame counts still run, because they need only the
+    parquet. Either way the report is *not* marked `ok` merely because the
+    round-trip passed -- "no source comparison" is a different answer from
+    "source comparison passed", and the GUI shows it as a third badge.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -896,6 +925,11 @@ def verify(
             "Pass an EpisodeStore to make the mapping trustable."
         )
 
+    # Source takes the store cannot hand over, collected rather than reported one
+    # by one: on a fifty-take export a whole session deleted after the fact would
+    # otherwise be fifty near-identical lines in the operator's face.
+    unresolved: list[str] = []
+
     for index in range(report.n_episodes):
         columns = dataset.get_episode_column_arrays(
             index, ["observation.state", "action", "timestamp", "frame_index"]
@@ -923,7 +957,11 @@ def verify(
         try:
             episode = store.load(source_id)
         except (FileNotFoundError, ValueError) as exc:
-            report.issues.append(f"episode {index}: source take {source_id} unreadable: {exc}")
+            # Not an issue: the take is not part of the dataset, and its absence
+            # says nothing about these bytes. The exception text is kept because
+            # "deleted from the store" and "on disk but unreadable" ask the
+            # operator for different things.
+            unresolved.append(f"episode {index} ({source_id}): {exc}")
             continue
 
         if len(state) != int(episode.meta.n_steps):
@@ -969,6 +1007,10 @@ def verify(
                 ).max()
             ),
         )
+        report.episodes_compared += 1
+
+    if unresolved:
+        report.skipped.append(_unresolved_note(unresolved, report))
 
     if check_videos:
         report.video_frames = _verify_videos(dataset_path, manifest, report)
@@ -996,6 +1038,34 @@ def verify(
             f"gripper angle differs by up to {report.gripper_error_max_deg:.3f} deg"
         )
     return report
+
+
+# How many unresolvable takes to name before summarising. Enough that a couple of
+# deleted takes are identified outright -- which is what the operator needs to
+# decide whether they care -- without turning a wiped session into a wall.
+_UNRESOLVED_SHOWN = 5
+
+
+def _unresolved_note(unresolved: list[str], report: VerifyReport) -> str:
+    """The `skipped` entry for source takes the store could not hand over.
+
+    Says three things, because each drives a different decision: how much of the
+    dataset went unchecked (is this dataset still worth citing), which takes are
+    gone (can they be recovered), and what the numbers in the report now cover
+    (are the errors below a whole-dataset claim -- they are not).
+    """
+    shown = unresolved[:_UNRESOLVED_SHOWN]
+    rest = len(unresolved) - len(shown)
+    listed = "; ".join(shown) + (f"; and {rest} more" if rest else "")
+    return (
+        f"{len(unresolved)}/{report.n_episodes} episodes could not be compared against "
+        "their source take: the take is no longer readable in the store, so nothing "
+        "checked those rows against what was recorded. The dataset itself is "
+        "unaffected -- it is still loadable and trainable -- but it can no longer be "
+        "audited against the recording or re-exported, and the error figures in this "
+        f"report cover only the {report.episodes_compared} episode(s) that were "
+        f"compared. Unresolved: {listed}"
+    )
 
 
 def _verify_videos(
@@ -1331,10 +1401,15 @@ def format_verify(report: VerifyReport) -> str:
             + ", ".join(f"{role} {n}" for role, n in sorted(report.video_frames.items()))
             + f" (rows {report.n_frames})"
         )
+    # Coverage qualifies every error figure that follows, so it is printed with
+    # them rather than left to the PARTIAL note at the bottom: "match to 0" over
+    # no compared episodes is not the same reading as over all of them.
     lines.append(
         f"  rows on disk match a fresh conversion to "
         f"{report.state_max_abs_error:.3g} (state) / "
-        f"{report.action_max_abs_error:.3g} (action)"
+        f"{report.action_max_abs_error:.3g} (action), over "
+        f"{report.episodes_compared}/{report.n_episodes} episode(s) compared "
+        "against their source take"
     )
     # Micrometres and microdegrees, because the honest answer here is float32
     # rounding and printing it in millimetres rounds it to a zero that looks
@@ -1363,7 +1438,8 @@ def format_verify(report: VerifyReport) -> str:
         lines.extend(f"    {note}" for note in report.skipped)
         lines.append(
             "  to make this a full check, re-export with this exporter so the "
-            "source-take mapping is recorded."
+            "source-take mapping is recorded -- which needs the source takes to "
+            "still be in the store."
         )
     else:
         lines.append("  OK -- this dataset replays back to what was recorded")

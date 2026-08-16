@@ -212,6 +212,42 @@ def test_dataset_verdict_is_marked_stale_when_files_change(tmp_path, config):
     assert entry["verdict"]["stale"] is True
 
 
+def test_writing_a_verdict_does_not_make_it_stale(tmp_path, config):
+    """A verdict is *about* the dataset, not part of it.
+
+    `verified_mtime` is read before `verify.json` is written, so counting that
+    file in the directory's mtime made the write itself the newest thing under
+    the dataset -- and every verdict came back "the dataset changed after it was
+    verified" within a second of being computed. Every dataset in the library
+    showed 过期, and re-verifying could never clear it.
+
+    The old export.json is aged deliberately: without it both writes land in the
+    same second and the one-second slack in the staleness test would hide the bug.
+    """
+    import os
+
+    from so_snake.data.export import VerifyReport
+    from so_snake.gui.exporter import Exporter
+
+    dataset_root = tmp_path / "lerobot"
+    dataset_root.mkdir()
+    path = _write_dataset(dataset_root, "ours", repo_id="so_snake/pick")
+    long_ago = time.time() - 3600
+    os.utime(path / "export.json", (long_ago, long_ago))
+
+    exporter = Exporter(EpisodeStore(tmp_path / "episodes"), config, dataset_root=dataset_root)
+    exporter._write_verdict(
+        path,
+        VerifyReport(repo_id="so_snake/pick", dataset_path=path, fps=30, action_space="delta"),
+    )
+
+    [entry] = exporter.datasets()["datasets"]
+    assert entry["verdict"]["ok"] is True
+    assert entry["verdict"]["stale"] is False
+    # And the mtime the UI reports is the dataset's, not the verdict's.
+    assert entry["modified"] == pytest.approx(long_ago, abs=1.0)
+
+
 def test_dataset_replay_dispatches_to_the_session(tmp_path, config):
     """`start_dataset_replay` is the bridge between the dataset page and the arm.
 

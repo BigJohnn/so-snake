@@ -488,8 +488,9 @@ export interface DatasetManifest {
 }
 
 /** What reading the dataset back off disk proved. The same shape `verify`
- *  produces in the CLI, with two extra fields: `stale` is the GUI's way of
- *  saying "the cached answer is older than the data it is about", and
+ *  produces in the CLI, with three extra fields: `stale` is the GUI's way of
+ *  saying "the cached answer is older than the data it is about",
+ *  `dataset_mtime` is what makes that judgement inspectable, and
  * `skipped` lists checks that did not run (no manifest, no source store)
  *  so a green `ok` cannot be read as "verified against source takes". */
 export interface DatasetVerdict {
@@ -499,6 +500,11 @@ export interface DatasetVerdict {
   action_space: string;
   n_episodes: number;
   n_frames: number;
+  /** How many episodes were compared against their source take. Below
+   *  `n_episodes`, the error figures cover only part of the dataset and the gaps
+   *  are named in `skipped` -- a take deleted after the export is a coverage gap,
+   *  not a defect, so it lands there and not in `issues`. */
+  episodes_compared: number;
   state_max_abs_error: number;
   action_max_abs_error: number;
   target_position_error_max_m: number;
@@ -510,6 +516,13 @@ export interface DatasetVerdict {
   skipped: string[];
   ok: boolean;
   verified_at: number;
+  /** The dataset's newest mtime *as of the verification*, stored in the file. */
   verified_mtime: number;
+  /** The dataset's newest mtime *now*, added by the gateway on read. Only this
+   *  one can say when the dataset changed; `verified_mtime` is what it was when
+   *  the answer was computed. Both exclude `verify.json` itself -- a verdict is
+   *  about the dataset, not part of it, and counting it made every verdict read
+   *  as stale the moment it was written. */
+  dataset_mtime: number;
   stale: boolean;
 }

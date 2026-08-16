@@ -66,7 +66,12 @@ VERDICT_NAME = "verify.json"
 # alternative is a green badge attesting to a check that was never run. (This
 # already bit once: `skipped` was added to the report, and verdicts written
 # before it lacked the field that decides OK from PARTIAL.)
-VERDICT_VERSION = 1
+#
+# 2: a source take missing from the store moved from `issues` to `skipped` (see
+#    `verify`), and `episodes_compared` was added. Verdicts written under 1 say
+#    FAILED where this version says PARTIAL, which is precisely the kind of stale
+#    claim this counter exists to discard.
+VERDICT_VERSION = 2
 
 
 @dataclass
@@ -229,6 +234,11 @@ class Exporter:
         unreadable one, and one written under a different `VERDICT_VERSION`.
         `stale` is the softer case: the verdict is this version's, but the
         dataset has been written to since, so the answer is about older bytes.
+
+        `dataset_mtime` rides along because the UI has to say *when* the dataset
+        changed, and the verdict alone cannot know that -- it only carries the
+        mtime as of its own run. Both are added here rather than stored, so they
+        describe the directory as it is now.
         """
         file = path / VERDICT_NAME
         try:
@@ -237,7 +247,9 @@ class Exporter:
             return None
         if not isinstance(verdict, dict) or verdict.get("version") != VERDICT_VERSION:
             return None
-        verdict["stale"] = float(verdict.get("verified_mtime", -1)) < _directory_mtime(path) - 1.0
+        mtime = _directory_mtime(path)
+        verdict["dataset_mtime"] = mtime
+        verdict["stale"] = float(verdict.get("verified_mtime", -1)) < mtime - 1.0
         return verdict
 
     def _write_verdict(self, path: Path, report: VerifyReport) -> None:
@@ -496,14 +508,25 @@ def _directory_size(path: Path) -> int:
 
 
 def _directory_mtime(path: Path) -> float:
-    """The newest mtime under `path`.
+    """The newest mtime under `path`, ignoring the verdict file.
 
     Not the directory's own: writing a file inside a subdirectory does not touch
     the root's mtime, so a dataset re-exported in place would look untouched and
     a cached verify verdict would stay green over changed bytes.
+
+    The verdict file is excluded because it is *about* the dataset rather than
+    part of it, and counting it made the staleness check self-defeating: the
+    mtime recorded inside `verify.json` is read before the file is written, so
+    the write itself became the newest thing under the directory and every
+    verdict read back as "the dataset changed after it was verified" -- within
+    seconds of being computed. Excluding it also keeps verifying a dataset from
+    reordering the library, which sorts on this number.
     """
+    verdict = path / VERDICT_NAME
     newest = 0.0
     for item in path.rglob("*"):
+        if item == verdict:
+            continue
         try:
             newest = max(newest, item.stat().st_mtime)
         except OSError:

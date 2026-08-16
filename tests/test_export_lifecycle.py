@@ -271,6 +271,40 @@ def test_verify_with_a_real_manifest_records_no_skips(tmp_path, config):
 
     assert report.skipped == []
     assert report.ok is True
+    # The error figures above are whole-dataset claims only when this says so.
+    assert report.episodes_compared == report.n_episodes == 1
+
+
+def test_verify_treats_a_deleted_source_take_as_skipped_not_failed(tmp_path, config):
+    """A take deleted after the export is a coverage gap, not a defect.
+
+    Deleting a take does not change a byte of the dataset, so the verdict must
+    not flip to FAILED over it -- otherwise "verified" stops being a property of
+    the dataset and starts depending on what else happens to be on the machine,
+    and the same export reads green on the bench that still holds the takes and
+    red on the training box that never had them.
+
+    What the report owes the operator instead: amber rather than green, the
+    unresolvable take named, and `episodes_compared` low enough that the
+    zero-valued error figures cannot be read as a whole-dataset claim.
+    """
+    import shutil
+
+    ep = tmp_path / "episodes"
+    ds_root = tmp_path / "lerobot"
+    full = _make_real_export(ep, ds_root, config)
+    [source_id] = json.loads((full / "export.json").read_text(encoding="utf-8"))["episode_ids"]
+
+    shutil.rmtree(ep / source_id)
+    report = verify(full, EpisodeStore(ep), so_snake_config=config)
+
+    assert report.issues == []
+    assert report.ok is True
+    assert report.episodes_compared == 0
+    # Named, counted, and honest about what the numbers now cover.
+    [note] = report.skipped
+    assert source_id in note
+    assert "1/1 episodes could not be compared" in note
 
 
 # ------------------------------------------------- overwrite the destructive

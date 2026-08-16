@@ -592,10 +592,25 @@ const toDeg = (v: number) => (v * 180) / Math.PI;
  *
  * The list is one session's worth of takes nine times out of ten, and then the
  * clock is what tells them apart; the tenth time it is last week's, and then the
- * date is the only thing that matters. */
+ * date is the only thing that matters.
+ *
+ * Parsed and formatted in local time rather than sliced out of the string:
+ * `created_at` is UTC (`...T13:39:28+00:00`), while the take *id* beside it is
+ * local (`ep_20260812_213928`), so slicing showed one take under two clocks
+ * eight hours apart -- and rolled "today" over eight hours early. */
 function shortTime(createdAt: string): string {
-  const today = new Date().toISOString().slice(0, 10);
-  return createdAt.slice(0, 10) === today ? createdAt.slice(11, 16) : createdAt.slice(5, 10);
+  const ms = Date.parse(createdAt);
+  if (!Number.isFinite(ms)) return "—";
+  const date = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  return sameDay
+    ? `${pad(date.getHours())}:${pad(date.getMinutes())}`
+    : `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 function formatDuration(seconds: number): string {
