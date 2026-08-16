@@ -39,6 +39,12 @@ export function ExportPanel() {
   const [error, setError] = useState("");
   const [showLog, setShowLog] = useState(false);
   const logRef = useRef<HTMLPreElement | null>(null);
+  // Off by default: the server refuses to overwrite an existing dataset
+  // directory unless this is set, and the operator has to tick the box
+  // explicitly. The confirmation prompt is the next line of defence; the
+  // checkbox is the one before it, and both matter because the destructive
+  // act is one click away either way.
+  const [overwrite, setOverwrite] = useState(false);
 
   const loadTasks = useCallback(async () => {
     try {
@@ -92,7 +98,8 @@ export function ExportPanel() {
     repo_id: effectiveRepoId,
     task: task || null,
     action_space: actionSpace,
-    verify: true
+    verify: true,
+    overwrite
   });
 
   const dryRun = async () => {
@@ -110,6 +117,14 @@ export function ExportPanel() {
 
   const start = async () => {
     setError("");
+    if (
+      overwrite &&
+      !window.confirm(
+        `覆盖 ${effectiveRepoId}:这会删除该目录里现有的全部 parquet、视频和 manifest,不可撤销。`
+      )
+    ) {
+      return;
+    }
     try {
       setProgress(await api.startExport(body()));
     } catch (cause) {
@@ -196,6 +211,24 @@ export function ExportPanel() {
           />
         </Field>
 
+        {/* Overwrite sits between the repo-id and the buttons, where it is
+            read together with them. Off by default -- the server refuses an
+            export into an existing directory without this, so a wrong repo-id
+            that points at someone else's dataset is a refused click, not a
+            silent replacement. */}
+        <label className="field-inline overwrite-toggle">
+          <input
+            type="checkbox"
+            checked={overwrite}
+            disabled={running}
+            onChange={(event) => setOverwrite(event.target.checked)}
+          />
+          <span>
+            覆盖同名数据集
+            <span className="dim small"> —— 会删除该目录下全部 parquet、视频和 manifest,不可撤销</span>
+          </span>
+        </label>
+
         <div className="row">
           <button className="btn" disabled={running || planning || !task} onClick={() => void dryRun()}>
             {planning ? "试算中…" : "试算(不写盘)"}
@@ -205,7 +238,7 @@ export function ExportPanel() {
             disabled={running || !task}
             onClick={() => void start()}
           >
-            导出
+            {overwrite ? "覆盖导出" : "导出"}
           </button>
           {running ? (
             <button className="btn small" onClick={() => void cancel()}>

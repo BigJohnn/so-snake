@@ -4,13 +4,26 @@ import { useSnapshot } from "./hooks";
 import { Banner, Pill } from "./components/ui";
 import { TeleopPage } from "./pages/TeleopPage";
 import { EpisodesPage } from "./pages/EpisodesPage";
+import { DatasetsPage } from "./pages/DatasetsPage";
 import { ReplayPage } from "./pages/ReplayPage";
 import { RoadmapPage } from "./pages/RoadmapPage";
 import type { AppConfig, Mode } from "./types";
 
+// The four pages are the four artifacts an operator juggles, not four ways to
+// view the same thing:
+//   * "录制" -- raw takes under data/episodes/, the review loop on what was
+//               recorded, ending in the export panel.
+//   * "训练集" -- exported LeRobot datasets under data/lerobot/, the library of
+//               what was produced, with verify and replay.
+//   * "回放" -- replay a raw take on the arm; the question is about the
+//               recording itself, so it sits with the recordings, not with
+//               the exports.
+// "进度" is the roadmap; it does not fit the artifact taxonomy but is the
+// page the operator reaches for when stuck.
 const PAGES = [
-  { key: "teleop", label: "遥操作 / 录制" },
-  { key: "episodes", label: "数据集" },
+  { key: "teleop", label: "遥操作" },
+  { key: "episodes", label: "录制" },
+  { key: "datasets", label: "训练集" },
   { key: "replay", label: "回放" },
   { key: "roadmap", label: "进度" }
 ] as const;
@@ -120,6 +133,8 @@ export default function App() {
           <TeleopPage config={config} snapshot={snapshot} run={run} />
         ) : page === "episodes" ? (
           <EpisodesPage />
+        ) : page === "datasets" ? (
+          <DatasetsPage config={config} snapshot={snapshot} run={run} />
         ) : page === "replay" ? (
           <ReplayPage config={config} snapshot={snapshot} run={run} />
         ) : (

@@ -246,9 +246,14 @@ ul.tight li { margin: 2px 0; }
 }
 .take:hover { background: var(--panel-2); }
 .take.selected { background: #16283a; border-left-color: var(--accent); }
+/* A dataset row, not a take row. The amber left rail is the visual contract
+   that says "this is an exported artifact, not a recording": on a page that
+   used to conflate the two, the rail is the first thing the eye lands on. */
+.take.dataset-row { border-left-color: var(--warn); padding-left: 11px; }
+.take.dataset-row.selected { border-left-color: var(--warn); background: #2a2310; }
 .take .title { font-size: 13px; margin-bottom: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .take .title .flag { color: var(--warn); margin-left: 6px; }
-.take .meta { display: flex; gap: 8px; font-size: 11px; color: var(--dim); }
+.take .meta { display: flex; gap: 8px; font-size: 11px; color: var(--dim); align-items: center; }
 .take .meta .accent { color: var(--accent); }
 .take .meta .physical { color: var(--danger); }
 .take .meta .when { margin-left: auto; }

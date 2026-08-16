@@ -5,7 +5,13 @@ import { SeriesPlot } from "../components/SeriesPlot";
 import { Banner, Card, Empty, Field, Pill, Stat } from "../components/ui";
 import type { EpisodeDetail, EpisodeMeta } from "../types";
 
-/* The dataset page is a triage bench, not a table.
+/* The recordings page: triage for *raw* takes, not the exported datasets.
+ *
+ * The two live under different roots (`data/episodes/` and `data/lerobot/`)
+ * and have different lifecycles, so they live on different pages too -- a
+ * verdict that applies to an export (the parquet reads back, the targets
+ * reconstruct) is not a verdict on a take (did the grasp work). This page
+ * answers the latter; the new "训练集" page answers the former.
  *
  * What actually happens here: a session just produced fifteen takes, and the
  * operator has to decide which ones are worth training on. That decision is
@@ -24,6 +30,10 @@ import type { EpisodeDetail, EpisodeMeta } from "../types";
  *     list, not managing files;
  *   * the plots keep the shared cursor and go underneath; the diagnostics that
  *     answer "why" fold away until asked for.
+ *
+ * The export panel sits at the bottom because export is the last step of
+ * review. Moving it onto the datasets page would mean leaving the page where
+ * the decision about *which* takes was made.
  *
  * The previous version was a wide table stacked on a two-column detail, and the
  * detail had three children in a two-column grid -- so the trajectory card, the
@@ -120,7 +130,7 @@ export function EpisodesPage() {
       <div className="dataset">
         <aside className="card take-list">
           <header>
-            <h2>数据集</h2>
+            <h2>录制</h2>
             <div className="spacer">
               <button className="btn small" onClick={() => void reload()}>
                 刷新
@@ -132,8 +142,8 @@ export function EpisodesPage() {
             {episodes.length > 1 ? <span className="dim"> · ↑↓ 切换</span> : null}
           </div>
           <div className="take-scroll">
-            {episodes.length === 0 ? (
-              <Empty>还没有录制。到「遥操作 / 录制」页启动会话并按录制。</Empty>
+            {            episodes.length === 0 ? (
+              <Empty>还没有原始 take 。到「遥操作」页启动会话并按录制 —— 录出来的原始数据在这里审,导出的训练集在「训练集」页。</Empty>
             ) : (
               episodes.map((episode) => (
                 <TakeRow
@@ -158,7 +168,7 @@ export function EpisodesPage() {
             />
           ) : (
             <Card title="预览">
-              <Empty>{episodes.length ? "选一条看看" : "还没有可看的 episode"}</Empty>
+              <Empty>{episodes.length ? "选一条看看" : "还没有可看的 take"}</Empty>
             </Card>
           )}
           {/* Last, under the take being judged: exporting is what happens after

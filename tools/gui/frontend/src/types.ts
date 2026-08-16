@@ -411,6 +411,10 @@ export type ExportPhase =
 export interface ExportProgress {
   phase: ExportPhase;
   running: boolean;
+  /** "export" or "verify". Both are long, both use this slot, and the UI
+   *  needs to know which it is watching so a verify on one dataset does
+   *  not get conflated with an export on another. */
+  kind: string;
   repo_id: string;
   task: string;
   dataset_path: string;
@@ -429,4 +433,75 @@ export interface ExportPlan {
   report: ExportReport;
   usable: number;
   config: Record<string, any>;
+}
+
+// ---------------------------------------------------------------- datasets
+
+/** One dataset on disk. Manifest and verdict are separate because one is the
+ *  dataset's own claim about itself and the other is what reading it back
+ *  proved -- they can disagree, and when they do the verdict wins.
+ *
+ *  `ours` distinguishes a manifest written by this exporter (so source-fidelity
+ *  is checkable) from a synthesized one (built from lerobot's info.json when
+ *  only the parquet is around -- replay works, verify-with-source does not). */
+export interface DatasetMeta {
+  name: string;
+  path: string;
+  size_bytes: number;
+  modified: number;
+  /** `null` when the directory is not a LeRobotDataset at all. When set but
+   *  `ours=false`, the manifest is synthesized from lerobot's `info.json` and
+   *  has no source mapping. */
+  manifest: DatasetManifest | null;
+  /** True when `manifest` was written by so-snake's exporter. */
+  ours: boolean;
+  /** `null` when no `verify.json` has been written yet. `stale=true` when the
+   *  directory's mtime has moved past the recorded verification -- the cached
+   *  answer no longer matches the bytes on disk. */
+  verdict: DatasetVerdict | null;
+}
+
+/** What the export wrote into `export.json`: the contract a dataset carries
+ *  with it, independent of the GUI. `episode_ids[i]` is the source take for
+ *  dataset episode `i` -- the only place that mapping lives. */
+export interface DatasetManifest {
+  repo_id: string;
+  root: string;
+  task: string | null;
+  fps: number;
+  action_space: string;
+  cameras: string[];
+  resolution: number[];
+  n_episodes: number;
+  n_frames: number;
+  cancelled: boolean;
+  episode_ids: string[];
+  episode_root: string;
+}
+
+/** What reading the dataset back off disk proved. The same shape `verify`
+ *  produces in the CLI, with two extra fields: `stale` is the GUI's way of
+ *  saying "the cached answer is older than the data it is about", and
+ * `skipped` lists checks that did not run (no manifest, no source store)
+ *  so a green `ok` cannot be read as "verified against source takes". */
+export interface DatasetVerdict {
+  repo_id: string;
+  dataset_path: string;
+  fps: number;
+  action_space: string;
+  n_episodes: number;
+  n_frames: number;
+  state_max_abs_error: number;
+  action_max_abs_error: number;
+  target_position_error_max_m: number;
+  target_angle_error_max_rad: number;
+  gripper_error_max_deg: number;
+  timestamp_max_error_s: number;
+  video_frames: Record<string, number>;
+  issues: string[];
+  skipped: string[];
+  ok: boolean;
+  verified_at: number;
+  verified_mtime: number;
+  stale: boolean;
 }

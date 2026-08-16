@@ -116,6 +116,7 @@ timestamp grid that disagrees with the rows) all live in the gap between them.
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -484,12 +485,20 @@ def export(
     so_snake_config: SoSnakeConfig | None = None,
     progress: Callable[[str, int, int, int], None] | None = None,
     should_continue: Callable[[], bool] | None = None,
+    overwrite: bool = False,
 ) -> ExportReport:
     """Write the selected episodes into a `LeRobotDataset` and report on it.
 
     `progress(episode_id, frames, done, total)` is called after each episode.
     `should_continue` is polled between episodes -- between, not within, so a
     cancelled export leaves whole episodes behind rather than half of one.
+
+    The target directory is owned by whoever is on the other end of this call.
+    If it already has files in it, this function refuses with `FileExistsError`
+    unless `overwrite=True` -- silent replacement of a dataset that an operator
+    was already using is a worse failure than refusing to start. The error
+    message names what's there, so the operator can decide between `--overwrite`
+    and a fresh directory.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -500,6 +509,24 @@ def export(
             + "\n".join(f"  {e.episode_id}: {e.reason}" for e in report.skipped)
         )
     fps = report.fps
+
+    root = Path(config.root)
+    if root.exists():
+        # Detect what is there so the operator's choice is informed: "replace
+        # this 10-episode / 4221-frame dataset" is a different decision from
+        # "replace this 4 KB stub from a half-deleted prior run".
+        existing_summary = _summarise_existing(root)
+        if not overwrite:
+            msg = (
+                f"dataset directory already exists at {root}"
+                + (f" ({existing_summary})" if existing_summary else "")
+                + ". Pass overwrite=True (or --overwrite on the CLI) to wipe it first; "
+                "otherwise pick a different --repo-id / --out."
+            )
+            raise FileExistsError(msg)
+        # Wipe before letting lerobot's `mkdir(exist_ok=False)` run, so the
+        # collision is ours to report and not a stack trace from inside lerobot.
+        shutil.rmtree(root)
 
     dataset = LeRobotDataset.create(
         repo_id=config.repo_id,
@@ -592,6 +619,41 @@ def write_manifest(report: ExportReport, config: ExportConfig) -> Path:
     return path
 
 
+def _summarise_existing(dataset_path: Path) -> str:
+    """A one-line summary of what is at `dataset_path`, for overwrite errors.
+
+    Reads lerobot's `info.json` when present (the common case -- a real
+    dataset the operator wrote earlier), and falls back to a size-only line
+    when the directory is a stub or a foreign format. Returning "" would be
+    worse: an operator who sees "directory exists" with no further
+    information has nothing to decide against.
+    """
+    info_path = dataset_path / "meta" / _LEROBOT_INFO_NAME
+    if info_path.is_file():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        else:
+            n_ep = int(info.get("total_episodes", 0))
+            n_fr = int(info.get("total_frames", 0))
+            return f"{n_ep} episodes / {n_fr} frames"
+    total = 0
+    try:
+        for item in dataset_path.rglob("*"):
+            try:
+                if item.is_file():
+                    total += item.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    if total:
+        return f"~{total / (1024 * 1024):.1f} MB on disk"
+    return "empty directory"
+    return path
+
+
 def read_manifest(dataset_path: Path) -> dict[str, Any]:
     """The export manifest for a dataset, or a clear failure."""
     path = Path(dataset_path) / MANIFEST_NAME
@@ -602,6 +664,73 @@ def read_manifest(dataset_path: Path) -> dict[str, Any]:
             "make it verifiable."
         )
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+# Lerobot's own metadata path. Stable across lerobot versions; documented in
+# `lerobot.datasets.lerobot_dataset` as the file every well-formed dataset has.
+_LEROBOT_INFO_NAME = "info.json"
+
+
+def _has_manifest(dataset_path: Path) -> bool:
+    """Whether our `export.json` sits next to a dataset on disk."""
+    return (Path(dataset_path) / MANIFEST_NAME).is_file()
+
+
+def _lerobot_meta(dataset_path: Path) -> dict[str, Any]:
+    """What lerobot's own `info.json` says about a dataset.
+
+    A fallback for `_dataset_meta`: fps and feature shapes are enough to make
+    a replayable `Episode`, and they are exactly what lerobot itself uses when
+    reading the dataset. Without this fallback a dataset that lost its
+    manifest (legacy export, foreign tool) would be unreadable to us even
+    though lerobot can still load it.
+
+    Action space is inferred from the action feature's names: a `dx/dy/dz/...`
+    prefix means `delta`, plain `x/y/z/...` means `absolute`. The convention
+    is what this exporter writes and what `apply_action` understands; reading
+    it back from the parquet keeps the two halves in agreement without
+    recording it explicitly.
+    """
+    info_path = Path(dataset_path) / "meta" / _LEROBOT_INFO_NAME
+    if not info_path.is_file():
+        raise FileNotFoundError(
+            f"{info_path} is missing: this is not a LeRobotDataset directory. "
+            "A dataset directory must have either so-snake's export.json "
+            "or lerobot's meta/info.json (or both)."
+        )
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    action_names = list(info["features"]["action"]["names"])
+    if action_names and all(action_names[i].startswith("d") for i in range(5)):
+        action_space = "delta"
+    else:
+        action_space = "absolute"
+    return {
+        # The repo_id is what lerobot writes into the parquet filenames; when
+        # our manifest is missing, the directory name is the only handle we
+        # have, and that is what an operator would have called it.
+        "repo_id": Path(dataset_path).name,
+        "root": str(dataset_path),
+        "task": None,
+        "fps": int(info["fps"]),
+        "action_space": action_space,
+        # `episode_ids` is the source mapping; without our manifest there is
+        # no source mapping, and downstream code must skip the source-fidelity
+        # branch (see `verify`).
+        "episode_ids": [],
+    }
+
+
+def _dataset_meta(dataset_path: Path) -> tuple[dict[str, Any], bool]:
+    """The metadata a dataset carries: ours if present, lerobot's if not.
+
+    Returns the metadata dict and `True`/`False` for "we wrote this". The
+    second value lets callers distinguish "we made this and the source
+    mapping is intact" from "we did not make this and the source mapping is
+    unknown" -- they answer different questions.
+    """
+    if _has_manifest(dataset_path):
+        return read_manifest(dataset_path), True
+    return _lerobot_meta(dataset_path), False
 
 
 @dataclass
@@ -626,7 +755,14 @@ class VerifyReport:
     gripper_error_max_deg: float = 0.0
     timestamp_max_error_s: float = 0.0
     video_frames: dict[str, int] = field(default_factory=dict)
+    # Failures: things that should be true about a usable dataset and are not.
+    # `ok` is False iff this list is non-empty.
     issues: list[str] = field(default_factory=list)
+    # Things we deliberately did not check, because the inputs weren't there
+    # (no manifest, no episode store). Not failures -- the dataset can still
+    # be replayed -- but the operator should know so a green `ok` is not
+    # read as "checked against source takes".
+    skipped: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -670,11 +806,19 @@ def verify(
     footer, a video short by a frame, a timestamp grid built from a rate nothing
     ran at. Pass `store=None` to check only what the dataset can check about
     itself.
+
+    A dataset without our `export.json` (foreign, legacy, or wiped by hand) is
+    still partially verifiable: the parquet round-trip, the time axis and the
+    video frame counts run regardless, because they need only the parquet.
+    Source-fidelity (the rows against the operator's recordings) cannot run
+    without the source mapping and is skipped; the report says so and is *not*
+    marked `ok` just because the round-trip passes -- "no source comparison" is
+    a different answer from "source comparison passed".
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset_path = Path(dataset_path)
-    manifest = read_manifest(dataset_path)
+    manifest, ours = _dataset_meta(dataset_path)
     report = VerifyReport(
         repo_id=str(manifest["repo_id"]),
         dataset_path=dataset_path,
@@ -692,13 +836,31 @@ def verify(
         )
 
     episode_ids = list(manifest.get("episode_ids", ()))
-    if len(episode_ids) != report.n_episodes:
+    # Without our manifest there is no source mapping at all. Without a store
+    # the source comparison cannot run even with a mapping. Either way, the
+    # round-trip and time-axis checks below still run -- they do not depend on
+    # source episodes -- and the report records what was skipped so the
+    # verdict cannot be misread as "verified against source takes".
+    if not ours:
+        report.skipped.append(
+            "export.json is missing: source-fidelity check skipped -- the "
+            "parquet was checked, but no comparison against source takes ran. "
+            "Re-export with this exporter to make the mapping trustable."
+        )
+        episode_ids = []
+    elif len(episode_ids) != report.n_episodes:
         report.issues.append(
             f"manifest lists {len(episode_ids)} source episodes but the dataset has "
             f"{report.n_episodes}; the mapping from dataset episode to take is not "
             "trustworthy and nothing below could be checked against its source"
         )
         episode_ids = []
+    elif store is None:
+        report.skipped.append(
+            "no episode store supplied: source-fidelity check skipped -- the "
+            "parquet was checked, but no comparison against source takes ran. "
+            "Pass an EpisodeStore to make the mapping trustable."
+        )
 
     for index in range(report.n_episodes):
         columns = dataset.get_episode_column_arrays(
@@ -1048,16 +1210,22 @@ def episode_from_dataset(
     joints here are solved by *today's* IK from the targets, which is precisely
     what task-mode replay does anyway. `joint` mode would be replaying this
     function's own arithmetic and would prove nothing.
+
+    A dataset that lost its `export.json` (foreign, legacy, or wiped by hand)
+    is still replayable, because everything replay needs -- fps, action space,
+    the parquet itself -- lives in lerobot's own `meta/info.json`. The
+    source-take mapping is the only thing the manifest adds, and replay has no
+    use for it; the rebuilt `Episode` simply has no `source_id` in its notes.
     """
     from ..m3_safety.ik5d import TaskIK5D
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     dataset_path = Path(dataset_path)
-    manifest = read_manifest(dataset_path)
-    fps = int(manifest["fps"])
-    action_space = str(manifest["action_space"])
+    meta, ours = _dataset_meta(dataset_path)
+    fps = int(meta["fps"])
+    action_space = str(meta["action_space"])
 
-    dataset = LeRobotDataset(str(manifest["repo_id"]), root=dataset_path)
+    dataset = LeRobotDataset(str(meta["repo_id"]), root=dataset_path)
     if not 0 <= episode_index < dataset.num_episodes:
         raise ValueError(
             f"episode {episode_index} is out of range; the dataset has "
@@ -1085,16 +1253,21 @@ def episode_from_dataset(
         joints[i] = result.joints_deg
         seed = result.joints_deg
 
-    source_ids = list(manifest.get("episode_ids", ()))
+    # Source mapping is the manifest's one contribution to replay: when ours,
+    # we name the take this came from. Without ours, we still build the
+    # episode -- the parquet is the source of truth for replay.
+    source_ids = list(meta.get("episode_ids", ()))
     source_id = source_ids[episode_index] if episode_index < len(source_ids) else ""
-    meta = EpisodeMeta(
+    notes = f"rebuilt from the exported dataset at {dataset_path}"
+    if source_id:
+        notes += f"; originally recorded as {source_id}"
+    elif not ours:
+        notes += "; no source mapping (so-snake's export.json is missing)"
+    meta_obj = EpisodeMeta(
         id=f"{dataset_path.name}#{episode_index}",
-        name=f"{manifest['repo_id']} episode {episode_index}",
-        task=str(manifest.get("task") or ""),
-        notes=(
-            f"rebuilt from the exported dataset at {dataset_path}"
-            + (f"; originally recorded as {source_id}" if source_id else "")
-        ),
+        name=f"{meta['repo_id']} episode {episode_index}",
+        task=str(meta.get("task") or ""),
+        notes=notes,
         n_steps=len(targets),
         # The dataset's grid is the take's measured rate, so this is the rate it
         # was recorded at -- which is what the replayer paces playback by.
@@ -1108,7 +1281,7 @@ def episode_from_dataset(
         "action.joint.commanded_deg": joints,
         "observation.state.task_pose": np.asarray(state[:, :5], dtype=float),
     }
-    return Episode(meta=meta, frames=frames, path=dataset_path)
+    return Episode(meta=meta_obj, frames=frames, path=dataset_path)
 
 
 def format_verify(report: VerifyReport) -> str:
@@ -1145,6 +1318,19 @@ def format_verify(report: VerifyReport) -> str:
     if report.issues:
         lines.append(f"  NOT REPLAYABLE -- {len(report.issues)} problem(s):")
         lines.extend(f"    {issue}" for issue in report.issues)
+    elif report.skipped:
+        # Round-trip passes; the source-fidelity branch is what was skipped.
+        # Saying only "OK" would make a no-source-mapping run look like a
+        # checked one -- that is exactly the silent failure this distinction
+        # exists to prevent.
+        lines.append(
+            f"  PARTIAL -- round-trip ok, {len(report.skipped)} check(s) skipped:"
+        )
+        lines.extend(f"    {note}" for note in report.skipped)
+        lines.append(
+            "  to make this a full check, re-export with this exporter so the "
+            "source-take mapping is recorded."
+        )
     else:
         lines.append("  OK -- this dataset replays back to what was recorded")
     return "\n".join(lines)

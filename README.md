@@ -331,9 +331,24 @@ PYTHONPATH=src .venv/bin/python scripts/record_episode.py --backend real --sourc
 
 ## 导出训练集(LeRobotDataset)
 
-**GUI 里有按钮**:数据集页翻到底,「导出训练集」。选技能 → 试算 → 导出。导出跑在后台
-线程上,能取消,关掉浏览器再打开会接回正在跑的那次。臂在动的时候会拒绝导出 —— 转码两路
-视频是本仓最重的活,而回路现在靠自旋守住 30 Hz,两者抢核。
+**GUI 里有按钮**:在「录制」页审完一批原始 take,翻到「导出训练集」面板:选技能 →
+试算 → 导出。导出跑在后台线程上,能取消,关掉浏览器再打开会接回正在跑的那次。臂在动
+的时候会拒绝导出 —— 转码两路视频是本仓最重的活,而回路现在靠自旋守住 30 Hz,两者
+抢核。
+
+「训练集」页是导出的归宿:每个数据集一个条目,带 manifest、缓存的校验结果、
+「重新校验」按钮和「在机械臂上回放」按钮。回放走的是和录制 take 回放同一套
+安全层(限速趋近、deg/s 钳位、关节/工作区限位、MuJoCo 网格干涉),所以一次回放
+既能验证导出是对的,也能确认策略确实能驱动这台臂。校验和回放都通过 HTTP
+(`/api/export/datasets`、`/api/export/verify`、`/api/replay/dataset`),不需要
+起终端。CLI `scripts/replay_lerobot_dataset.py` 走的是同一个 `SessionManager.start_dataset_replay`。
+
+**没有 `export.json` 的数据集依然能跑**(foreign dataset、老 export、被人手动
+删过 manifest 的):`episode_from_dataset` 直接读 lerobot 的 `meta/info.json`
+拿 fps 和 action space,replay 跟有 manifest 时一模一样;`verify` 会跑
+round-trip / 时间轴 / 视频帧数,但 **不会**跟源 take 比对(没有 source
+mapping),verdict 标 PARTIAL 而不是 OK。完整校验要做的事:在「录制」页用「覆盖
+同名数据集」重新导一次,这会写新的 `export.json`。
 
 命令行同样一套:
 
@@ -347,6 +362,11 @@ PYTHONPATH=src .venv/bin/python scripts/export_lerobot_dataset.py --task "牛牛
 **按 task 标签选**,一次导一个技能 —— 一个 store 里放着几种任务,混着训出来的策略学的
 是它们的平均。`--dry-run` 走完除了解码和写盘之外的全部流程(筛选、测帧率、算动作统计),
 先跑它:一条 take 视频对不齐,在这里发现最便宜。
+
+**目标目录已存在会拒绝**(默认行为):`FileExistsError`,消息里说明那里有
+多少条 / 多少帧 / 多大。覆盖要显式 `--overwrite`(GUI:导出面板的「覆盖同名
+数据集」复选框,会弹一次确认)。这是 destructive 操作,默认拦截是为了不让一个
+写错的 `--out` 把别人的数据集擦掉。
 
 ### 映射:绝对 5D 流形位姿 → 同一张图上的增量
 
@@ -612,12 +632,15 @@ clutch 即停(无运动尾巴)、夹爪可控、退出卸力。真机接入的�
 - [x] 本机 Web GUI:遥操作、录制、回放、进度看板
 - [x] **真实 USB 双相机接入 GUI**:按缩略图指派视角(编号不可信,见上)、两路实时预览优先于仿真相机;采集在 lerobot 线程上,读帧 0.0014 ms,回路无损
 - [x] **相机帧写入 episode**:每个视角一个 mp4,编码在独立线程上,每控制步一帧保证 video 帧 i == npz 行 i;编码器按机器探测选(缺 CPU 用硬编,缺磁盘用软编),选中结果与理由写进 `meta.json`
-- [x] **数据集页双路视频回看**:两路相机与轨迹曲线共用游标,按帧号对齐(不是时间戳 —— 实测 19.2 s 的 take 视频文件只有 16.7 s,按时间对齐片尾会差 2.5 s)
+- [x] **录制页双路视频回看**:两路相机与轨迹曲线共用游标,按帧号对齐(不是时间戳 —— 实测 19.2 s 的 take 视频文件只有 16.7 s,按时间对齐片尾会差 2.5 s)
 - [x] **修掉第二路相机的「跳帧播放」**:第二路从来没人调过 `play()`,它只靠 `onTimeUpdate` 里的 seek 前进,而浏览器把 `timeupdate` 限到 ~4 Hz —— 于是主画面 30 fps、腕部画面 4 fps 一顿一顿。现在第二路跟随第一路的 play/pause/seek/倍速,帧号校正只是校正
 - [x] **修掉帧号「1, 9, 17」跳着走**:同一个 `timeupdate` 4 Hz 的根因 —— 30 fps ÷ 4 Hz = 每次跳 ~8 帧。`currentTime` 本身是连续的,粗的只是事件,所以改成播放时用 `requestAnimationFrame` 采样,索引变了才回调。配套把 `SeriesPlot` 里按样本数计费的部分(1200 点 path 字符串 ×5 图)`useMemo` 掉,否则光标每帧移动会重建它们
 - [x] **LeRobotDataset 导出**:按 task 选、5D manifold state + manifold 增量 action(锚在测量位姿上,所以 rollout 自纠)、帧率量出来而不是读配置(rollout 与示范同速,偏差 1.6%)、两路相机;**GUI 里一个按钮**(试算 → 后台导出 → 可取消),臂在动时拒绝
 - [x] **导出后读回校验,证明可回放**:重新打开盘上的 parquet/manifest/mp4,查行是否一致、`apply_action` 是否还能反解出当初的 5D target、每行每路是否各有一帧。实测 1672 行还原误差 0.010 µm、时间轴差 0.9 µs;顺带发现原来**从没调过 `LeRobotDataset.finalize()`**(不调 parquet 页脚不写,数据集加载不了)
-- [x] **导出的数据能真的放回臂上**:`scripts/replay_lerobot_dataset.py` 把导出 episode 还原成 `Episode`,交给同一个 `EpisodeReplayer`(安全层零复制)。558 步实测跑完,任务位置误差 p95 0.0034 mm
+- [x] **导出的数据能真的放回臂上**:「训练集」页有「在机械臂上回放」按钮,跟 `scripts/replay_lerobot_dataset.py` 走同一个 `SessionManager.start_dataset_replay`(安全层零复制)。558 步实测跑完,任务位置误差 p95 0.0034 mm
+- [x] **原始 take 和导出训练集分成两页**:`data/episodes/` 下的叫「录制」(审 raw take,审完翻到底导出),`data/lerobot/` 下的叫「训练集」(每个数据集带 manifest + 缓存校验结果,可以重新校验、可以回放)。同一页混着展示会让人把只对导出成立的校验 verdict 误读成对 take 的;分开之后每页的 verdict 是什么就是什么
+- [x] **没有 `export.json` 的数据集也能用**:`episode_from_dataset` 直接读 lerobot 的 `meta/info.json` 拿 fps 和 action space,replay 不再被 manifest 卡住;`verify` 在这种情况下跑 round-trip 和时间轴,但**不会**跟源 take 比对(没有 source mapping),verdict 标 PARTIAL 而不是 OK。本仓历史里那条 `niuniu_pick_place`(10 条 / 4221 帧, 26 Hz)就是这样 — 用现在的代码可以回放,PARTIAL 校验过(round-trip / 时间轴 / 视频帧数全过)
+- [x] **覆盖同名数据集是显式 destructive 操作**:`export()` 默认拒绝写进已存在的目录,错误里说明那里有几条 / 几帧 / 多大。覆盖要 `--overwrite`(CLI)或「覆盖同名数据集」复选框(GUI,弹确认)。这是 destructive 操作,默认拦截是为了不让一个写错的 `--out` 把别人的数据集擦掉
 - [x] **回路真的跑到 30 Hz**(原来 26.3):不是活慢(每步 ≈5 ms),是 `time.sleep` 在 macOS 上多睡 4 ms,且旧代码从迭代开头算剩余把每次超时都永久记账。改成递推绝对 deadline + 6 ms 自旋尾,补偿封顶一个周期。回放同步修(原来两个 bug 互相抵消)
 - [x] **帧率改按「步周期中位数」测**,不再用 `n_steps / duration_s`:按录制键会触发一次 ~700 ms 的编码器探测,一条 292 步的 take 里这一步就把均值从 30.1 拽到 28.2(0.3% 的步造成 6% 的误差)。探测结果现在缓存并在开会话时预热,按下录制的代价从 678 ms 降到 0.05 ms
 - [x] **录制补上夹爪实测角**(format v2):总线本来就读到了,v1 把它切掉了 —— 指令角看不出夹爪堵在物体上

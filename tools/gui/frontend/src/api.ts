@@ -3,6 +3,7 @@ import type {
   AppConfig,
   BackendKind,
   CameraScan,
+  DatasetMeta,
   EpisodeDetail,
   EpisodeMeta,
   ExportPlan,
@@ -139,8 +140,45 @@ export const api = {
   /** Starts the background job. Refused while the arm is being driven. */
   startExport: (body: ExportBody) => post<ExportProgress>("/api/export/start", body),
   exportStatus: () => request<ExportProgress>("/api/export/status"),
-  cancelExport: () => post<ExportProgress>("/api/export/cancel")
+  cancelExport: () => post<ExportProgress>("/api/export/cancel"),
+
+  // -------------------------------------------------------------- datasets
+
+  /** The library of exported datasets. Lives under a separate path from the
+   *  raw takes (`data/lerobot/` vs `data/episodes/`), which is why it is its
+   *  own endpoint rather than a filter on `/api/episodes`. */
+  datasets: () =>
+    request<{ datasets: DatasetMeta[]; root: string }>("/api/export/datasets"),
+
+  /** Re-run the read-back check on an already-written dataset. Long-running:
+   *  it decodes every video, so the answer comes back through the existing
+   *  `/api/export/status` poll. */
+  startVerify: (dataset: string) =>
+    post<ExportProgress>("/api/export/verify", { dataset }),
+
+  /** Replay a dataset episode onto the arm, through the same safety layer a
+   *  recorded take is replayed through. `mode` is fixed to `task` server-side:
+   *  the dataset carries no joint stream on purpose. */
+  startReplayDataset: (body: DatasetReplayBody) =>
+    post<Snapshot>("/api/replay/dataset", body)
 };
+
+export interface DatasetReplayBody {
+  dataset: string;
+  episode_index?: number;
+  backend?: BackendKind;
+  source?: SourceKind;
+  port?: string;
+  robot_id?: string;
+  max_relative_target_deg?: number;
+  /** Playback rate multiplier. `speed <= 0` is rejected by the gateway. */
+  speed?: number;
+  /** When true, runs as fast as the safety layer allows; off by default
+   *  because dataset replay is a thing people watch. */
+  realtime?: boolean;
+  /** Skip the MuJoCo mesh-clearance guard. Off by default. */
+  check_clearance?: boolean;
+}
 
 export interface ExportBody {
   repo_id: string;
@@ -154,6 +192,11 @@ export interface ExportBody {
   /** Read the dataset back after writing and check it replays. Defaults true
    *  server-side, and there is no good reason to turn it off. */
   verify?: boolean;
+  /** Wipe the target directory before writing. Destructive: the previous
+   *  parquet, videos and manifest are deleted. Off by default -- the server
+   *  refuses with a 409 if the directory already exists, so an unrelated
+   *  dataset cannot be overwritten by mistake. */
+  overwrite?: boolean;
 }
 
 export const episodeVideoUrl = (id: string, camera: string) =>

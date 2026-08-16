@@ -165,12 +165,17 @@ class Exporter:
     def datasets(self) -> dict[str, Any]:
         """Every exported dataset under the dataset root, newest first.
 
-        Read from each dataset's own `export.json`, which is the only thing that
-        records which takes it was built from -- lerobot's metadata has nowhere
-        to put that. A directory without one is listed anyway, marked as not
-        ours: it is still a dataset somebody may care about, and silently hiding
-        it would be worse than saying it cannot be verified.
+        The entry for each dataset carries the manifest when it exists, and a
+        synthesized equivalent when it does not. The synthesized manifest comes
+        from lerobot's own `meta/info.json` -- enough for the GUI to know the
+        episode count, fps and action space (so replay can pick an episode)
+        without claiming a source mapping we do not have. `episode_ids` is the
+        single thing the manifest uniquely contributes, and it stays empty for
+        synthesized ones; the GUI uses that to decide whether to show
+        "原始 take"折叠面板.
         """
+        from ..data.export import _dataset_meta
+
         root = self.dataset_root
         if not root.is_dir():
             return {"datasets": [], "root": str(root)}
@@ -185,12 +190,20 @@ class Exporter:
                 "size_bytes": _directory_size(path),
                 "modified": _directory_mtime(path),
                 "manifest": None,
+                # `ours` is the GUI's hook for "this dataset has a manifest we
+                # wrote, so source-fidelity is checkable". Synthesized
+                # manifests get `false`; the GUI uses this to gate the "原始
+                # take"折叠面板 rather than inferring from `episode_ids`.
+                "ours": False,
                 "verdict": None,
             }
             try:
-                entry["manifest"] = read_manifest(path)
+                manifest, ours = _dataset_meta(path)
+                entry["manifest"] = manifest
+                entry["ours"] = ours
             except (FileNotFoundError, ValueError, OSError):
                 entry["manifest"] = None
+                entry["ours"] = False
             entry["verdict"] = self._read_verdict(path)
             found.append(entry)
         found.sort(key=lambda e: e["modified"], reverse=True)
@@ -286,7 +299,13 @@ class Exporter:
 
     # ---------------------------------------------------------------- export
 
-    def start(self, config: ExportConfig, *, do_verify: bool = True) -> dict[str, Any]:
+    def start(
+        self,
+        config: ExportConfig,
+        *,
+        do_verify: bool = True,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             if self._progress.running:
                 raise RuntimeError(
@@ -302,7 +321,10 @@ class Exporter:
                 dataset_path=str(config.root or ""),
             )
             self._thread = threading.Thread(
-                target=self._run, args=(config, do_verify), name="so-snake-export", daemon=True
+                target=self._run,
+                args=(config, do_verify, overwrite),
+                name="so-snake-export",
+                daemon=True,
             )
             self._thread.start()
         return self.progress()
@@ -311,7 +333,7 @@ class Exporter:
         self._stop.set()
         return self.progress()
 
-    def _run(self, config: ExportConfig, do_verify: bool) -> None:
+    def _run(self, config: ExportConfig, do_verify: bool, overwrite: bool) -> None:
         try:
             self._log(f"exporting {config.task or 'every task'} -> {config.repo_id}")
             report = export(
@@ -320,6 +342,7 @@ class Exporter:
                 so_snake_config=self.config,
                 progress=self._on_episode,
                 should_continue=lambda: not self._stop.is_set(),
+                overwrite=overwrite,
             )
             with self._lock:
                 self._progress.report = _report_payload(report)
@@ -412,6 +435,9 @@ def _verify_payload(report: VerifyReport) -> dict[str, Any]:
     payload = asdict(report)
     payload["dataset_path"] = str(report.dataset_path)
     payload["ok"] = report.ok
+    # `skipped` may not exist on older VerifyReport definitions; defaulting
+    # here keeps the gateway honest if someone reverts that field.
+    payload.setdefault("skipped", [])
     return payload
 
 

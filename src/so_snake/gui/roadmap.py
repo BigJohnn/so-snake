@@ -195,7 +195,7 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 "Task-selected export to LeRobotDataset with reached-pose state, "
                 "measurement-anchored 5D delta action, absolute gripper, measured "
                 "dataset fps and two camera streams. Driven from a button on the "
-                "dataset page -- dry run, then a background job with progress -- or "
+                "recordings page -- dry run, then a background job with progress -- or "
                 "from the CLI. The lerobot import is lazy, so recording keeps its "
                 "numpy-only dependency surface.",
                 module="so_snake.data.export",
@@ -226,10 +226,30 @@ ROADMAP: tuple[dict[str, Any], ...] = (
                 "approach, same deg/s clamp, same joint limits, same mesh clearance "
                 "check. None of that safety logic is duplicated. Task mode only: the "
                 "dataset carries no joint stream by design, so joints are solved from "
-                "the targets, which is what task-mode replay does anyway.",
+                "the targets, which is what task-mode replay does anyway. Triggered "
+                "from the datasets page (one click, same rig controls as a take "
+                "replay) or from scripts/replay_lerobot_dataset.py -- the two paths "
+                "go through the same `SessionManager.start_dataset_replay`.",
                 module="so_snake.data.export",
                 evidence="558-step exported episode replayed on the mock arm: "
                          "completed, task position error p95 0.0034 mm, IK converged 99.1%",
+            ),
+            _item(
+                "raw-vs-exported", "Raw takes and exported datasets live on different pages",
+                "done",
+                "What `data/episodes/` and `data/lerobot/` have in common stops at "
+                "both being JSON-shaped. A page that mixed them invited reading a "
+                "verdict that only applied to the export as if it spoke about the "
+                "take. The recordings page is now labelled \"录制\" and shows raw "
+                "takes; a new \"训练集\" page lists the exported datasets, shows the "
+                "manifest + cached verify verdict, and re-runs verify / replays any "
+                "dataset onto the arm. Dataset rows wear an amber rail in the library; "
+                "the recordings page does not.",
+                module="so_snake.gui.server",
+                evidence="/api/export/datasets, /api/export/verify, /api/replay/dataset "
+                         "wired through the gateway; tests/test_gui_datasets.py "
+                         "covers list, verify, replay, path-traversal and the busy-arm "
+                         "refusal",
             ),
             _item(
                 "task-labels", "Task-labelled training batch", "done",

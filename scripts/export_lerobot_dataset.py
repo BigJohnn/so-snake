@@ -76,6 +76,13 @@ def parse_args() -> argparse.Namespace:
                              "it replays to what was recorded, then exit")
     parser.add_argument("--no-verify", action="store_true",
                         help="skip the read-back check that normally follows an export")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="wipe the target directory before exporting. Destructive: "
+                             "the existing parquet, videos and manifest are deleted. "
+                             "Use when re-running an export into a directory whose "
+                             "contents should be replaced; refuse without the flag "
+                             "otherwise, so an unrelated dataset cannot be overwritten "
+                             "by mistake.")
     return parser.parse_args()
 
 
@@ -141,8 +148,11 @@ def main() -> int:
             print("DRY RUN — nothing written")
             print(format_report(report, config))
             return 0 if usable else 1
-        report = export(store, config, progress=progress)
-    except ValueError as error:
+        report = export(store, config, progress=progress, overwrite=args.overwrite)
+    except (ValueError, FileExistsError) as error:
+        # Both end up on stderr and exit non-zero: a 4xx-shaped refusal (the
+        # caller can fix it) reads the same as a 5xx-shaped one if the exit
+        # code or stream differs, and both deserve to.
         print(str(error), file=sys.stderr)
         return 1
     print(format_report(report, config))

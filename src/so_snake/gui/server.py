@@ -227,7 +227,9 @@ class Gateway:
                 "for the machine. Stop the session first."
             )
         return self.exporter.start(
-            self.export_config_from_body(body), do_verify=bool(body.get("verify", True))
+            self.export_config_from_body(body),
+            do_verify=bool(body.get("verify", True)),
+            overwrite=bool(body.get("overwrite", False)),
         )
 
     def episodes_payload(self) -> dict[str, Any]:
@@ -405,10 +407,12 @@ class GuiHandler(BaseHTTPRequestHandler):
     def _guard(self, action: Callable[[], Any]) -> None:
         """Run an action, mapping its failures onto status codes.
 
-        The three cases are genuinely different and the UI shows them
-        differently: a bad request is the caller's fault, a conflict means the
-        arm is busy and the operator should stop what is running, and anything
-        else is a bug worth surfacing rather than swallowing.
+        The cases are genuinely different and the UI shows them differently: a
+        bad request is the caller's fault, a not-found means the named artifact
+        isn't on disk, a conflict means something else owns the resource (the
+        arm is busy, or a dataset directory already exists for an export that
+        asked not to overwrite), and anything else is a bug worth surfacing
+        rather than swallowing.
         """
         try:
             self._json(HTTPStatus.OK, action())
@@ -416,6 +420,11 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.BAD_REQUEST, str(exc))
         except FileNotFoundError as exc:
             self._error(HTTPStatus.NOT_FOUND, str(exc))
+        except FileExistsError as exc:
+            # A refused overwrite looks identical to the operator either way;
+            # 409 is what tells the UI "this is fixable on your side, retry
+            # with overwrite=true" rather than 500 "the server crashed".
+            self._error(HTTPStatus.CONFLICT, str(exc))
         except RuntimeError as exc:
             self._error(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -449,6 +458,14 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(self.gateway.ports_payload)
         elif path == "/api/export/tasks":
             self._guard(self.gateway.exporter.tasks)
+        elif path == "/api/export/datasets":
+            # The library: every dataset under `data/lerobot/`, with its cached
+            # verify verdict when one exists. Listed separately from raw takes
+            # because the two are different artifacts with different lifecycles:
+            # a take lives under `data/episodes/`, an export under
+            # `data/lerobot/`. Mixing them on one page invites reading a verdict
+            # that only applies to the export as if it spoke about the take.
+            self._guard(self.gateway.exporter.datasets)
         elif path == "/api/export/status":
             self._guard(self.gateway.exporter.progress)
         elif path == "/api/episode/video":
@@ -629,8 +646,27 @@ class GuiHandler(BaseHTTPRequestHandler):
                     replay_from_body(body),
                 )
             )
+        elif path == "/api/replay/dataset":
+            # Replay an exported dataset episode onto the arm. Goes through
+            # `SessionManager` rather than the exporter for the same reason as
+            # `/api/replay/start`: this moves the arm, so the one-thing-at-a-time
+            # rule applies. `episode_index` is dataset-episode order, which the
+            # manifest records the source take for, so the operator can always
+            # recover what they are watching.
+            self._guard(
+                lambda: self.gateway.start_dataset_replay(
+                    {**body, "mode": "task"}
+                )
+            )
         elif path == "/api/replay/stop":
             self._guard(session.stop)
+        elif path == "/api/export/verify":
+            # Re-run the read-back check on an already-written dataset. Same
+            # slot as the export because both decode every video and walk every
+            # row -- running them together would only make each slower. The
+            # verdict is cached next to the dataset so the library view does not
+            # re-decode on every page load.
+            self._guard(lambda: self.gateway.exporter.start_verify(str(body.get("dataset", ""))))
         elif path == "/api/episode/annotate":
             self._guard(
                 lambda: self.gateway.session.store.annotate(
