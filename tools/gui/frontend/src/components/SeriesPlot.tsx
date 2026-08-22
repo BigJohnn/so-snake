@@ -13,7 +13,7 @@ import { useMemo, useRef, useState } from "react";
  * index in fixed order. Fixed order matters: the joint traces keep their colour
  * when a filter hides one, so `elbow_flex` is the same green in every plot. */
 
-export const SERIES_COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181"];
+export const SERIES_COLORS = ["#197d7b", "#d75a39", "#238254", "#b47716", "#ad4f75"];
 
 export interface Series {
   label: string;
@@ -180,7 +180,7 @@ export function SeriesPlot({
   if (!x.length || !domain || !geometry) {
     return (
       <svg ref={measure} className="plot" height={height} role="img" aria-label={placeholder}>
-        <text x="50%" y="50%" textAnchor="middle" fill="#5c6775" fontSize="11" fontFamily="var(--mono)">
+        <text x="50%" y="50%" textAnchor="middle" fill="var(--dim)" fontSize="11" fontFamily="var(--mono)">
           {placeholder}
         </text>
       </svg>
@@ -249,7 +249,7 @@ export function SeriesPlot({
               y={PAD.top}
               width={rect.w}
               height={plotH}
-              fill="#4b9fea"
+              fill="var(--accent)"
               opacity={0.09}
             />
           ))
@@ -262,10 +262,10 @@ export function SeriesPlot({
               x2={PAD.left + plotW}
               y1={py(tick)}
               y2={py(tick)}
-              stroke="#262e3a"
+              stroke="var(--line)"
               strokeWidth={1}
             />
-            <text x={PAD.left - 6} y={py(tick) + 3.5} textAnchor="end" fontSize="10" fill="#5c6775" fontFamily="var(--mono)">
+            <text x={PAD.left - 6} y={py(tick) + 3.5} textAnchor="end" fontSize="10" fill="var(--dim)" fontFamily="var(--mono)">
               {format(tick)}
             </text>
           </g>
@@ -278,11 +278,11 @@ export function SeriesPlot({
               x2={PAD.left + plotW}
               y1={py(reference.value)}
               y2={py(reference.value)}
-              stroke="#8b97a6"
+              stroke="var(--muted)"
               strokeWidth={1}
               strokeDasharray="4 4"
             />
-            <text x={PAD.left + plotW} y={py(reference.value) - 4} textAnchor="end" fontSize="10" fill="#8b97a6" fontFamily="var(--mono)">
+            <text x={PAD.left + plotW} y={py(reference.value) - 4} textAnchor="end" fontSize="10" fill="var(--muted)" fontFamily="var(--mono)">
               {reference.label}
             </text>
           </g>
@@ -312,7 +312,7 @@ export function SeriesPlot({
         ) : null}
         {hover !== null ? (
           <g>
-            <line x1={px(hover)} x2={px(hover)} y1={PAD.top} y2={PAD.top + plotH} stroke="#8b97a6" strokeWidth={1} />
+            <line x1={px(hover)} x2={px(hover)} y1={PAD.top} y2={PAD.top + plotH} stroke="var(--muted)" strokeWidth={1} />
             {series.map((s, i) => {
               const v = s.values[hover];
               if (v === null || v === undefined || !Number.isFinite(v)) return null;
@@ -323,7 +323,7 @@ export function SeriesPlot({
                   cy={py(v)}
                   r={3.5}
                   fill={s.color ?? SERIES_COLORS[i % SERIES_COLORS.length]}
-                  stroke="#151a21"
+                  stroke="var(--panel)"
                   strokeWidth={2}
                 />
               );
@@ -331,10 +331,10 @@ export function SeriesPlot({
           </g>
         ) : null}
 
-        <text x={PAD.left} y={height - 3} fontSize="10" fill="#5c6775" fontFamily="var(--mono)">
+        <text x={PAD.left} y={height - 3} fontSize="10" fill="var(--dim)" fontFamily="var(--mono)">
           {format(x[0])}s
         </text>
-        <text x={PAD.left + plotW} y={height - 3} textAnchor="end" fontSize="10" fill="#5c6775" fontFamily="var(--mono)">
+        <text x={PAD.left + plotW} y={height - 3} textAnchor="end" fontSize="10" fill="var(--dim)" fontFamily="var(--mono)">
           {format(x[n - 1])}s
         </text>
       </svg>

@@ -91,6 +91,7 @@ export default function App() {
     <div className="app">
       <div className="topbar">
         <div className="brand">
+          <img className="brand-mark" src="/so-snake-mark.png" alt="so-snake" />
           so-snake<span>SO-ARM100 遥操作与数据采集</span>
         </div>
         <nav className="nav">
