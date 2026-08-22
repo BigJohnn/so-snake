@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, type ExportBody } from "../api";
+import { api, ApiError, episodeVideoUrl, type ExportBody } from "../api";
 import { Banner, Field, Pill, Segmented } from "./ui";
 import type { ActionSpace, ExportPlan, ExportProgress, TaskSummary } from "../types";
 
@@ -33,6 +33,10 @@ export function ExportPanel() {
   const [task, setTask] = useState("");
   const [repoId, setRepoId] = useState("");
   const [actionSpace, setActionSpace] = useState<ActionSpace>("delta");
+  // New recordings are 60 Hz; 30 Hz is the default training cadence and keeps
+  // the model loop lighter without losing row/video alignment.
+  const [outputHz, setOutputHz] = useState<"native" | "30">("30");
+  const [roi, setRoi] = useState<Record<string, [number, number, number, number]>>({});
   const [plan, setPlan] = useState<ExportPlan | null>(null);
   const [planning, setPlanning] = useState(false);
   const [progress, setProgress] = useState<ExportProgress | null>(null);
@@ -98,6 +102,10 @@ export function ExportPanel() {
     repo_id: effectiveRepoId,
     task: task || null,
     action_space: actionSpace,
+    // Native preserves the recorder's measured rate (normally 60 Hz).  30 is
+    // a proper stride-2 export: state/action/video rows are sampled together.
+    fps: outputHz === "30" ? 30 : null,
+    roi,
     verify: true,
     overwrite
   });
@@ -169,6 +177,9 @@ export function ExportPanel() {
             onChange={(event) => {
               setTask(event.target.value);
               setPlan(null);
+              // ROI is a property of the camera framing for this task, not a
+              // global preference. Do not carry a crop into another scene.
+              setRoi({});
             }}
           >
             {tasks.length === 0 ? <option value="">(还没有录制)</option> : null}
@@ -201,6 +212,22 @@ export function ExportPanel() {
             ]}
           />
         </Field>
+
+        <Field label="训练集帧率" hint="录制默认 60 Hz；选择 30 Hz 会每两帧保留一帧，并按保留帧重新计算动作增量。">
+          <Segmented<"native" | "30">
+            value={outputHz}
+            disabled={running}
+            onChange={(value) => { setOutputHz(value); setPlan(null); }}
+            options={[{ value: "native", label: "原始（通常 60 Hz）" }, { value: "30", label: "下采样 30 Hz" }]}
+          />
+        </Field>
+
+        <RoiControls
+          sampleEpisode={selected?.sample_episode ?? ""}
+          value={roi}
+          disabled={running}
+          onChange={(next) => { setRoi(next); setPlan(null); }}
+        />
 
         <Field label="repo id" hint={`留空就用 ${`so_snake/${slugify(task)}`};写到 ${datasetRoot}`}>
           <input
@@ -301,6 +328,61 @@ export function ExportPanel() {
       </div>
     </section>
   );
+}
+
+const CAMERA_ROLES = ["third_person", "wrist"] as const;
+type Roi = [number, number, number, number];
+const FULL_ROI: Roi = [0, 0, 1, 1];
+
+/** Choose image coordinates from an actual take. Values are normalised, so a
+ * wrist camera renegotiating 1080p instead of 720p does not silently move the
+ * policy's field of view. The video is only an aid for selection; export and
+ * rollout use the same stored rectangle on their full-resolution RGB frames. */
+function RoiControls({
+  sampleEpisode, value, disabled, onChange
+}: {
+  sampleEpisode: string;
+  value: Record<string, Roi>;
+  disabled: boolean;
+  onChange: (next: Record<string, Roi>) => void;
+}) {
+  const setEnabled = (role: string, enabled: boolean) => {
+    const next = { ...value };
+    if (enabled) next[role] = FULL_ROI;
+    else delete next[role];
+    onChange(next);
+  };
+  const setPart = (role: string, index: number, raw: number) => {
+    const before = value[role] ?? FULL_ROI;
+    const next: Roi = [...before] as Roi;
+    next[index] = raw;
+    // Keep a rectangle valid while the operator drags either edge.
+    if (index === 0) next[2] = Math.min(next[2], 1 - next[0]);
+    if (index === 1) next[3] = Math.min(next[3], 1 - next[1]);
+    if (index === 2) next[2] = Math.min(next[2], 1 - next[0]);
+    if (index === 3) next[3] = Math.min(next[3], 1 - next[1]);
+    onChange({ ...value, [role]: next.map((n) => Number(n.toFixed(3))) as Roi });
+  };
+  return <details className="roi-controls">
+    <summary>图像 ROI（可选）<span className="dim"> — 裁掉与任务无关区域；训练与 rollout 使用同一裁剪</span></summary>
+    {!sampleEpisode ? <Banner tone="warn">当前任务没有可用的录制样例，无法预览 ROI。</Banner> : null}
+    {CAMERA_ROLES.map((role) => {
+      const enabled = role in value;
+      const region = value[role] ?? FULL_ROI;
+      return <section className="roi-role" key={role}>
+        <label className="row small"><input type="checkbox" checked={enabled} disabled={disabled} onChange={(event) => setEnabled(role, event.target.checked)} /> 裁剪 {role}</label>
+        {enabled ? <>
+          {sampleEpisode ? <div className="roi-preview">
+            <video src={episodeVideoUrl(sampleEpisode, role)} muted autoPlay loop playsInline />
+            <div className="roi-box" style={{ left: `${region[0] * 100}%`, top: `${region[1] * 100}%`, width: `${region[2] * 100}%`, height: `${region[3] * 100}%` }} />
+          </div> : null}
+          <div className="roi-sliders">
+            {(["左", "上", "宽", "高"] as const).map((label, index) => <label key={label}>{label} {Math.round(region[index] * 100)}%<input type="range" min="0" max={index < 2 ? 0.95 : 1} step="0.01" value={region[index]} disabled={disabled} onChange={(event) => setPart(role, index, Number(event.target.value))} /></label>)}
+          </div>
+        </> : null}
+      </section>;
+    })}
+  </details>;
 }
 
 /** The dry run's answer: what would go in, what would not, and at what rate. */

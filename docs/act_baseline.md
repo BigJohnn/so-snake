@@ -1,8 +1,9 @@
 # The ACT baseline: what the training set commits to, and why
 
-**Implemented decision, one open item.** The export exists
+**Implemented decision.** The export exists
 (`scripts/export_lerobot_dataset.py`), a dataset has been written, and ACT
-trains on this laptop. The rollout runner is not written. Companion to the
+trains on this laptop. The rollout runner is available through the GUI's
+Rollouts page and `scripts/rollout_policy.py`. Companion to the
 README's "导出训练集 / 在 MacBook Pro M1 上训练" sections.
 
 Continues [`plan_5dof_task_space.md`](plan_5dof_task_space.md), whose frozen
@@ -302,15 +303,10 @@ tuning or the clutch feel before the next batch.
 
 ## Where to pick up
 
-1. **Write the rollout runner.** `export.apply_action()` is already its half of
-   the action-space contract and is covered by a round-trip test — an anchor that
-   disagrees between training and rollout is silent and shows up only as an arm
-   that creeps. `EpisodeReplayer` (`data/replay.py`) is structurally the same
-   thing with the joint targets coming from a file instead of a network, so its
-   safety layer (rate limit in deg/s, joint clamp against *current* limits,
-   move-to-first-frame, mesh clearance) is reusable whole. Hold the last command
-   across the 22 ms re-planning stall rather than blocking the loop.
-2. **Then record to ~50 usable takes** with the object in varied positions.
+1. **Record to ~50 usable takes** with the object in varied positions.
+2. **Bench-test each rollout checkpoint** first; the rollout records task and
+   action-space choices and applies task-space, IK, joint-rate and mesh-clearance
+   checks before reaching the backend.
 
 Do not change the state/action contract above without re-exporting; the anchor
 is not recoverable from a trained checkpoint.

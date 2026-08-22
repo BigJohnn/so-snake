@@ -7,7 +7,9 @@ import { EpisodesPage } from "./pages/EpisodesPage";
 import { DatasetsPage } from "./pages/DatasetsPage";
 import { ReplayPage } from "./pages/ReplayPage";
 import { RoadmapPage } from "./pages/RoadmapPage";
-import type { AppConfig, Mode } from "./types";
+import { TrainPage } from "./pages/TrainPage";
+import { RolloutsPage } from "./pages/RolloutsPage";
+import type { AppConfig, Mode, TrainingStatus } from "./types";
 
 // The four pages are the four artifacts an operator juggles, not four ways to
 // view the same thing:
@@ -24,6 +26,8 @@ const PAGES = [
   { key: "teleop", label: "遥操作" },
   { key: "episodes", label: "录制" },
   { key: "datasets", label: "训练集" },
+  { key: "train", label: "Train" },
+  { key: "rollouts", label: "Rollouts" },
   { key: "replay", label: "回放" },
   { key: "roadmap", label: "进度" }
 ] as const;
@@ -34,6 +38,7 @@ const MODE_LABEL: Record<Mode, string> = {
   idle: "空闲",
   teleop: "遥操作中",
   replay: "回放中",
+  rollout: "策略执行中",
   homing: "归位中",
   held: "已归位 · 保持力矩"
 };
@@ -43,6 +48,7 @@ export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [configError, setConfigError] = useState("");
   const [actionError, setActionError] = useState("");
+  const [training, setTraining] = useState<TrainingStatus | null>(null);
   const { snapshot, error: pollError, refresh } = useSnapshot();
 
   useEffect(() => {
@@ -50,6 +56,14 @@ export default function App() {
       .config()
       .then(setConfig)
       .catch((cause) => setConfigError(cause instanceof ApiError ? cause.message : String(cause)));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => api.trainingStatus().then((s) => !cancelled && setTraining(s)).catch(() => undefined);
+    void tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
   /* Every mutation funnels through here so that one place decides what a failure
@@ -71,7 +85,7 @@ export default function App() {
 
   const mode = snapshot?.mode ?? "idle";
   const physical = Boolean(snapshot?.spec?.physical) && mode !== "idle";
-  const busy = mode !== "idle";
+  const busy = mode !== "idle" || Boolean(training?.running && training.kind === "rollout");
 
   return (
     <div className="app">
@@ -94,7 +108,7 @@ export default function App() {
 
       <div className={`statusbar${physical ? " physical" : ""}`}>
         <Pill tone={busy ? "ok" : "neutral"} live={busy}>
-          {MODE_LABEL[mode]}
+          {training?.running && training.kind === "rollout" ? "策略执行中" : MODE_LABEL[mode]}
         </Pill>
         {snapshot?.spec ? (
           <>
@@ -115,7 +129,7 @@ export default function App() {
           <strong style={{ color: "var(--danger)" }}>真机通电中 —— 手放急停旁</strong>
         ) : null}
         <div style={{ marginLeft: "auto" }}>
-          <button className="btn danger" disabled={!busy} onClick={() => void run(api.stop)}>
+          <button className="btn danger" disabled={!busy} onClick={() => void run(() => training?.running && training.kind === "rollout" ? api.stopTraining() : api.stop())}>
             停止 (全部)
           </button>
         </div>
@@ -137,6 +151,10 @@ export default function App() {
           <DatasetsPage config={config} snapshot={snapshot} run={run} />
         ) : page === "replay" ? (
           <ReplayPage config={config} snapshot={snapshot} run={run} />
+        ) : page === "train" ? (
+          <TrainPage />
+        ) : page === "rollouts" ? (
+          <RolloutsPage config={config} snapshot={snapshot} />
         ) : (
           <RoadmapPage />
         )}

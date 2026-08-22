@@ -218,7 +218,10 @@ class IK5DConfig:
 class TeleopConfig:
     """Teleoperation loop tuning."""
 
-    control_hz: float = 30.0
+    # Record at 60 Hz by default.  This preserves the short contact/gripper
+    # events that are costly to reconstruct after the fact; export can create
+    # a time-consistent 30 Hz training set when a lighter policy loop is wanted.
+    control_hz: float = 60.0
 
     # Rest configuration, specified in joint space rather than as a TCP pose.
     #
@@ -235,7 +238,8 @@ class TeleopConfig:
 
     # Per-axis translation gain applied to the controller's normalised input,
     # in metres per control step. joycon-robotics integrates 1 mm per tick at
-    # unit dof_speed; at 30 Hz that is 30 mm/s, which is deliberately slow.
+    # unit dof_speed; tune this against the physical controller when changing
+    # the control-loop frequency.
     translation_step_m: tuple[float, float, float] = (0.0015, 0.0015, 0.0015)
 
     # Extra gain for manual translation. The left stick drives table-plane X/Y;

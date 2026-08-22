@@ -6,7 +6,7 @@
 浏览器 ──HTTP──▶ scripts/serve_gui.py
                     └─ so_snake.gui.server      HTTP + 静态文件
                        └─ so_snake.gui.session  SessionManager(同一时刻只有一件事在驱动机械臂)
-                          ├─ TeleopLoop         30 Hz 控制回路
+                          ├─ TeleopLoop         60 Hz 控制回路（导出可下采样至 30 Hz）
                           ├─ EpisodeRecorder    写 data/episodes/
                           └─ EpisodeReplayer    回放
 ```
@@ -260,7 +260,7 @@ HEVC 还要显式打 `hvc1` tag:VideoToolbox 默认打 `hev1`,QuickTime / 预览
 跟着走。
 
 **对齐用的是帧号,不是时间戳**,这一点必须清楚。录制时每个控制步写一帧,所以 video 帧
-*i* 就是 `frames.npz` 的第 *i* 行 —— 但文件的帧率写的是配置里的 `control_hz`(30),
+*i* 就是 `frames.npz` 的第 *i* 行 —— 但文件的帧率写的是当次配置里的 `control_hz`,
 而回路实跑只有 26 Hz 左右。实测 `ep_20260810_232308`:501 帧,录制时长 **19.22 s**,
 视频文件时长 **16.70 s**,差 2.52 s。按时间戳对齐的话,片尾会错开两秒半 —— 对一条抓取
 演示来说这是致命的。帧号才是两边真正共享的坐标。

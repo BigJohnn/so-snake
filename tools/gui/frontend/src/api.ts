@@ -16,6 +16,7 @@ import type {
   SourceKind,
   TaskSummary
 } from "./types";
+import type { ModelMeta, TrainingStatus } from "./types";
 
 // The gateway answers failures with `{"error": "..."}` and a 4xx/5xx, so the
 // message the operator sees is the one the robot code actually raised --
@@ -160,7 +161,24 @@ export const api = {
    *  recorded take is replayed through. `mode` is fixed to `task` server-side:
    *  the dataset carries no joint stream on purpose. */
   startReplayDataset: (body: DatasetReplayBody) =>
-    post<Snapshot>("/api/replay/dataset", body)
+    post<Snapshot>("/api/replay/dataset", body),
+
+  // ------------------------------------------------------------ train/rollout
+  models: () => request<{ models: ModelMeta[]; root: string }>("/api/models"),
+  trainingStatus: () => request<TrainingStatus>("/api/training/status"),
+  startTraining: (body: {
+    dataset: string; policy: "act" | "pi05"; name: string; device: string; steps: number; batch_size: number; base_model?: string;
+    wandb?: { enabled: boolean; project?: string; entity?: string; notes?: string; mode?: string };
+    autodl?: { enabled: boolean; host?: string; user?: string; port?: string; root?: string; python?: string };
+    pi_mode?: "expert" | "full";
+  }) => post<TrainingStatus>("/api/training/start", body),
+  stopTraining: () => post<TrainingStatus>("/api/training/stop"),
+  deleteModels: (names: string[]) => post<{ deleted: string[] }>("/api/models/delete", { names }),
+  startPolicyRollout: (body: {
+    checkpoint: string; task: string; action_space: ActionSpace; backend: BackendKind; port?: string;
+    cameras?: Record<string, number | string>; steps: number; device?: string;
+    max_relative_target_deg?: number; confirm_real?: boolean;
+  }) => post<TrainingStatus>("/api/rollout/start", body)
 };
 
 export interface DatasetReplayBody {
@@ -188,6 +206,8 @@ export interface ExportBody {
   cameras?: string[];
   resolution?: [number, number];
   fps?: number | null;
+  /** Normalised role -> [x, y, width, height] crop. */
+  roi?: Record<string, [number, number, number, number]>;
   include_aborted?: boolean;
   /** Read the dataset back after writing and check it replays. Defaults true
    *  server-side, and there is no good reason to turn it off. */

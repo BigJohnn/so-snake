@@ -151,7 +151,11 @@ class Exporter:
         by_task: dict[str, dict[str, Any]] = {}
         for meta in metas:
             entry = by_task.setdefault(
-                meta.task or "", {"task": meta.task or "", "takes": 0, "steps": 0, "seconds": 0.0}
+                meta.task or "", {"task": meta.task or "", "takes": 0, "steps": 0, "seconds": 0.0,
+                                 # The ROI editor uses a real recorded frame,
+                                 # not a live camera, so the export contract is
+                                 # chosen from the evidence it will transform.
+                                 "sample_episode": meta.id}
             )
             entry["takes"] += 1
             entry["steps"] += int(meta.n_steps)

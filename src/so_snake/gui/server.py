@@ -34,6 +34,7 @@ import numpy as np
 
 from ..config import REPO_ROOT, SoSnakeConfig
 from ..data import ACTION_SPACES, DEFAULT_EPISODE_ROOT, ExportConfig, ReplayConfig
+from ..data.export import validate_roi
 from ..devices import DeviceDetectionError, detect_arm_port, list_serial_ports
 from ..m0_perception import CAMERA_ROLES, CameraSpec, scan_devices
 from ..rig import RigSpec, availability, mujoco_import_error
@@ -41,6 +42,7 @@ from .exporter import DEFAULT_DATASET_ROOT, Exporter
 from .preview import encode_png, ensure_headless_gl, placeholder_png
 from .roadmap import roadmap_payload
 from .session import SessionManager
+from .training import TrainingManager
 
 DEFAULT_FRONTEND_DIST = REPO_ROOT / "tools" / "gui" / "frontend" / "dist"
 
@@ -66,6 +68,7 @@ class Gateway:
         self.config = config or SoSnakeConfig()
         self.session = SessionManager(self.config, episode_root)
         self.exporter = Exporter(self.session.store, self.config, dataset_root)
+        self.training = TrainingManager()
         self.frontend_dist = Path(frontend_dist)
         self.lock = threading.Lock()
 
@@ -190,6 +193,14 @@ class Gateway:
         width = int(np.clip(width, 64, 1920))
 
         fps = body.get("fps")
+        raw_roi = body.get("roi") or {}
+        if not isinstance(raw_roi, dict):
+            raise ValueError("roi must be an object of camera role -> [x, y, width, height]")
+        roi: dict[str, tuple[float, float, float, float]] = {}
+        for role, region in raw_roi.items():
+            if role not in cameras:
+                raise ValueError(f"ROI camera {role!r} is not selected for export")
+            roi[str(role)] = validate_roi(region, label=f"ROI for {role}")
         root = self.exporter.dataset_root / repo_id.split("/", 1)[1]
         return ExportConfig(
             repo_id=repo_id,
@@ -200,6 +211,7 @@ class Gateway:
             cameras=tuple(cameras),
             resolution=(height, width),
             fps=(int(fps) if fps else None),
+            roi=roi,
             include_aborted=bool(body.get("include_aborted", False)),
             episode_root=self.session.store.root,
         )
@@ -231,6 +243,50 @@ class Gateway:
             do_verify=bool(body.get("verify", True)),
             overwrite=bool(body.get("overwrite", False)),
         )
+
+    def start_training(self, body: dict[str, Any]) -> dict[str, Any]:
+        dataset = self.exporter.resolve(str(body.get("dataset", "")))
+        return self.training.start_train(
+            dataset=dataset,
+            policy=str(body.get("policy", "act")),
+            name=str(body.get("name", "")),
+            device=str(body.get("device", "cpu")),
+            steps=int(body.get("steps", 20_000)),
+            batch_size=int(body.get("batch_size", 8)),
+            base_model=str(body.get("base_model", "")),
+            wandb=body.get("wandb") if isinstance(body.get("wandb"), dict) else None,
+            autodl=body.get("autodl") if isinstance(body.get("autodl"), dict) else None,
+            pi_mode=str(body.get("pi_mode", "expert")),
+        )
+
+    def start_policy_rollout(self, body: dict[str, Any]) -> dict[str, Any]:
+        if self.session.busy:
+            raise RuntimeError("cannot start a policy rollout while the arm is busy")
+        if str(body.get("backend", "mock")) == "real" and not bool(body.get("confirm_real", False)):
+            raise ValueError("confirm_real is required before a policy can move the real arm")
+        if not str(body.get("task", "")).strip():
+            raise ValueError("task is required for a policy rollout")
+        checkpoint = Path(str(body.get("checkpoint", "")))
+        cameras = body.get("cameras") or {}
+        if not isinstance(cameras, dict):
+            raise ValueError("cameras must be an object of role -> device")
+        tail = [f"--backend={str(body.get('backend', 'mock'))}", f"--steps={int(np.clip(int(body.get('steps', 300)), 1, 100_000))}",
+                f"--max-relative-target={float(np.clip(float(body.get('max_relative_target_deg', 5.0)), .5, 20.0))}"]
+        if body.get("port"):
+            tail.extend(["--port", str(body["port"])])
+        if body.get("device"):
+            tail.extend(["--device", str(body["device"])])
+        if str(body.get("action_space", "delta")) == "absolute":
+            tail.append("--action-space=absolute")
+        for role, device in cameras.items():
+            if role in CAMERA_ROLES and device not in (None, ""):
+                tail.extend(["--camera", f"{role}={device}"])
+        return self.training.start_rollout(checkpoint=checkpoint, task=str(body.get("task", "")), argv_tail=tail)
+
+    def require_no_policy_rollout(self) -> None:
+        job = self.training.status()
+        if job["running"] and job["kind"] == "rollout":
+            raise RuntimeError("cannot start an arm session while a policy rollout owns the arm")
 
     def episodes_payload(self) -> dict[str, Any]:
         return {
@@ -468,6 +524,10 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(self.gateway.exporter.datasets)
         elif path == "/api/export/status":
             self._guard(self.gateway.exporter.progress)
+        elif path == "/api/training/status":
+            self._guard(self.gateway.training.status)
+        elif path == "/api/models":
+            self._guard(self.gateway.training.models)
         elif path == "/api/episode/video":
             self._serve_episode_video(_str_param(query, "id"), _str_param(query, "camera"))
         elif path == "/api/preview.png":
@@ -611,11 +671,11 @@ class GuiHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/session/start":
-            self._guard(lambda: session.start_session(spec_from_body(body)))
+            self._guard(lambda: (self.gateway.require_no_policy_rollout(), session.start_session(spec_from_body(body)))[1])
         elif path == "/api/session/stop":
             self._guard(session.stop)
         elif path == "/api/session/home":
-            self._guard(lambda: session.start_homing(spec_from_body(body)))
+            self._guard(lambda: (self.gateway.require_no_policy_rollout(), session.start_homing(spec_from_body(body)))[1])
         elif path == "/api/record/start":
             self._guard(
                 lambda: session.start_recording(
@@ -640,11 +700,11 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(lambda: session.decide_last_take(keep=bool(body.get("keep", True))))
         elif path == "/api/replay/start":
             self._guard(
-                lambda: session.start_replay(
+                lambda: (self.gateway.require_no_policy_rollout(), session.start_replay(
                     str(body.get("episode_id", "")),
                     spec_from_body(body),
                     replay_from_body(body),
-                )
+                ))[1]
             )
         elif path == "/api/replay/dataset":
             # Replay an exported dataset episode onto the arm. Goes through
@@ -654,9 +714,9 @@ class GuiHandler(BaseHTTPRequestHandler):
             # manifest records the source take for, so the operator can always
             # recover what they are watching.
             self._guard(
-                lambda: self.gateway.start_dataset_replay(
+                lambda: (self.gateway.require_no_policy_rollout(), self.gateway.start_dataset_replay(
                     {**body, "mode": "task"}
-                )
+                ))[1]
             )
         elif path == "/api/replay/stop":
             self._guard(session.stop)
@@ -688,6 +748,14 @@ class GuiHandler(BaseHTTPRequestHandler):
             self._guard(lambda: self.gateway.start_export(body))
         elif path == "/api/export/cancel":
             self._guard(self.gateway.exporter.cancel)
+        elif path == "/api/training/start":
+            self._guard(lambda: self.gateway.start_training(body))
+        elif path == "/api/training/stop":
+            self._guard(self.gateway.training.stop)
+        elif path == "/api/rollout/start":
+            self._guard(lambda: self.gateway.start_policy_rollout(body))
+        elif path == "/api/models/delete":
+            self._guard(lambda: self.gateway.training.delete_models(body.get("names", [])))
         else:
             self._error(HTTPStatus.NOT_FOUND, f"no such endpoint: {path}")
 

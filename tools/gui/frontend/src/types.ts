@@ -4,7 +4,7 @@
 
 /** "held" is homed-and-energized: nothing is driving the arm, but torque is on
  *  and it is standing at the home pose. Only a stop releases it. */
-export type Mode = "idle" | "teleop" | "replay" | "homing" | "held";
+export type Mode = "idle" | "teleop" | "replay" | "homing" | "held" | "rollout";
 export type BackendKind = "mock" | "mujoco" | "real";
 export type SourceKind = "scripted" | "pro";
 export type ReplayMode = "joint" | "task";
@@ -346,6 +346,7 @@ export interface TaskSummary {
   takes: number;
   steps: number;
   seconds: number;
+  sample_episode: string;
 }
 
 /** Why one take was or was not included in an export. */
@@ -361,6 +362,7 @@ export interface ExportEpisodeReport {
    *  `measured_fps` means the loop missed its rate then, which is baked into
    *  the take — no amount of re-exporting raises it. */
   configured_hz: number;
+  source_stride: number;
 }
 
 export interface ExportReport {
@@ -480,6 +482,8 @@ export interface DatasetManifest {
   action_space: string;
   cameras: string[];
   resolution: number[];
+  /** Normalised crop per camera, carried into the trained model for rollout. */
+  roi?: Record<string, [number, number, number, number]>;
   n_episodes: number;
   n_frames: number;
   cancelled: boolean;
@@ -525,4 +529,33 @@ export interface DatasetVerdict {
    *  as stale the moment it was written. */
   dataset_mtime: number;
   stale: boolean;
+}
+
+// ---------------------------------------------------------------- training
+
+export type PolicyKind = "act" | "pi05";
+
+export interface ModelMeta {
+  name: string;
+  path: string;
+  modified: number;
+  size_bytes: number;
+  checkpoint: string;
+  ready: boolean;
+  policy: string;
+  roi: Record<string, [number, number, number, number]>;
+}
+
+export interface TrainingStatus {
+  kind: "" | "train" | "autodl" | "rollout";
+  running: boolean;
+  phase: string;
+  name: string;
+  pid: number;
+  started_at: number;
+  ended_at: number;
+  exit_code: number | null;
+  error: string;
+  command: string[];
+  log: string[];
 }

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from dataclasses import replace
 
 from so_snake.config import SoSnakeConfig
 from so_snake.data import (
@@ -22,14 +23,25 @@ from so_snake.data import (
     observed_task_pose,
     plan,
 )
-from so_snake.data.export import STATE_DIM, resolve_fps, select_episodes
+from so_snake.data.export import (
+    STATE_DIM,
+    crop_image,
+    replay_targets_from_state_action,
+    resolve_fps,
+    sample_indices,
+    select_episodes,
+)
 from so_snake.m4_execution import MockFollower
 from so_snake.teleop import ScriptedSource, TeleopLoop
 
 
 @pytest.fixture(scope="module")
 def config() -> SoSnakeConfig:
-    return SoSnakeConfig()
+    # These export fixtures model the pre-60 Hz archive, so their 26/30 Hz
+    # timing assertions remain a compatibility test rather than changing the
+    # product default back from 60 Hz.
+    base = SoSnakeConfig()
+    return replace(base, teleop=replace(base.teleop, control_hz=30.0))
 
 
 def record(root, config, *, steps: int = 60, task: str = "pick", cameras: bool = True):
@@ -247,6 +259,34 @@ def test_explicit_fps_is_honoured(tmp_path, config):
     assert resolve_fps([episode], ExportConfig(repo_id="t/t", fps=10)) == 10
 
 
+def test_60hz_take_exports_a_time_consistent_30hz_stride(tmp_path, config):
+    """30 Hz is not video-only decimation: state and delta action share it."""
+    config = SoSnakeConfig()
+    meta = record(tmp_path, config, steps=60, cameras=True)
+    at_rate(tmp_path, meta, 60.0)
+    episode = EpisodeStore(tmp_path).load(meta.id)
+    export_config = ExportConfig(repo_id="t/t", task="pick", fps=30)
+    report, usable = plan(EpisodeStore(tmp_path), export_config)
+
+    assert report.fps == 30
+    assert report.n_frames == 30
+    assert report.episodes[0].source_stride == 2
+    _, state, action = usable[0]
+    indices = sample_indices(episode, 30)
+    targets, _ = replay_targets_from_state_action(state, action, "delta")
+    np.testing.assert_allclose(targets, episode.task_target[indices], atol=1e-5)
+
+
+def test_roi_uses_normalised_coordinates_before_resize():
+    image = np.arange(6 * 10 * 3, dtype=np.uint8).reshape(6, 10, 3)
+    cropped = crop_image(image, (0.2, 1 / 3, 0.5, 0.5))
+    np.testing.assert_array_equal(cropped, image[2:5, 2:7])
+
+
+def test_recording_default_is_60hz():
+    assert SoSnakeConfig().teleop.control_hz == 60.0
+
+
 # ------------------------------------------------------------- screening
 
 
@@ -294,7 +334,7 @@ def test_off_rate_episode_is_rejected_from_a_shared_timeline(tmp_path, config):
     report, usable = plan(EpisodeStore(tmp_path), ExportConfig(repo_id="t/t", task="pick"))
     assert report.fps == 26  # the median holds, the outlier does not move it
     assert sorted(e.meta.id for e, _, _ in usable) == sorted(m.id for m in good)
-    assert "Hz, dataset is" in report.skipped[0].reason
+    assert "integer frame grid" in report.skipped[0].reason
 
 
 def test_plan_reports_zero_action_share(tmp_path, config):
@@ -482,6 +522,20 @@ def test_export_body_clamps_the_resolution(tmp_path, config):
         {"repo_id": "t/t", "resolution": [8000, 9000]}
     )
     assert export_config.resolution == (1080, 1920)
+
+
+def test_export_body_accepts_only_a_normalised_roi_for_selected_camera(tmp_path, config):
+    from so_snake.gui.server import Gateway
+
+    gateway = Gateway(config, episode_root=tmp_path)
+    parsed = gateway.export_config_from_body(
+        {"repo_id": "t/t", "roi": {"wrist": [0.1, 0.2, 0.7, 0.6]}}
+    )
+    assert parsed.roi == {"wrist": (0.1, 0.2, 0.7, 0.6)}
+    with pytest.raises(ValueError, match="normalised"):
+        gateway.export_config_from_body(
+            {"repo_id": "t/t", "roi": {"wrist": [0.4, 0.2, 0.7, 0.6]}}
+        )
 
 
 def test_the_task_list_counts_what_each_label_would_contribute(tmp_path, config):

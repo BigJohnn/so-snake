@@ -165,10 +165,15 @@ class ExportConfig:
     cameras: tuple[str, ...] = ("third_person", "wrist")
     resolution: tuple[int, int] = (240, 320)  # (height, width)
 
-    # None measures the rate from the takes. An explicit value is honoured and
-    # reported against the measurement, because overriding it is exactly the
-    # thing that makes a rollout run at the wrong speed.
+    # None measures the rate from the takes. An explicit lower rate is allowed
+    # only when it is an integer source-frame stride (normally 60 -> 30), so
+    # image, state and action keep one honest time grid.
     fps: int | None = None
+
+    # Normalised camera crop `(x, y, width, height)`, keyed by role.  Keeping
+    # this in [0, 1] rather than raw pixels makes the same observation contract
+    # survive cameras that negotiate a different native capture resolution.
+    roi: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
 
     # An episode whose measured rate is this far from the dataset rate is
     # rejected: it cannot share a single-integer timeline with the others.
@@ -190,6 +195,11 @@ class ExportConfig:
         height, width = self.resolution
         if height <= 0 or width <= 0:
             raise ValueError(f"resolution must be positive, got {self.resolution}")
+        unknown = set(self.roi) - set(self.cameras)
+        if unknown:
+            raise ValueError(f"ROI names cameras not being exported: {sorted(unknown)}")
+        for role, region in self.roi.items():
+            validate_roi(region, label=f"ROI for {role}")
 
 
 @dataclass
@@ -209,6 +219,8 @@ class EpisodeReport:
     # property of the recording, not of the export, so no amount of re-exporting
     # will change it.
     configured_hz: float = 0.0
+    # Source frames per exported frame.  `1` means no temporal downsampling.
+    source_stride: int = 1
 
 
 @dataclass
@@ -253,6 +265,7 @@ def build_state_action(
     episode: Episode,
     action_space: str,
     config: SoSnakeConfig | None = None,
+    indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     """`(state, action, gripper_was_measured)` for one episode.
 
@@ -264,6 +277,19 @@ def build_state_action(
     gripper_state, gripper_measured = episode.measured_gripper_deg()
     gripper_cmd = np.asarray(episode.gripper_cmd_deg, dtype=np.float32)
 
+    if indices is None:
+        indices = np.arange(len(pose), dtype=np.int64)
+    else:
+        indices = np.asarray(indices, dtype=np.int64)
+        if indices.ndim != 1 or not len(indices) or indices[0] < 0 or indices[-1] >= len(pose):
+            raise ValueError("sample indices must be a non-empty increasing range within the episode")
+        if np.any(np.diff(indices) <= 0):
+            raise ValueError("sample indices must be strictly increasing")
+
+    pose = pose[indices]
+    target = target[indices]
+    gripper_state = np.asarray(gripper_state, dtype=np.float32)[indices]
+    gripper_cmd = gripper_cmd[indices]
     state = np.concatenate(
         [pose, np.asarray(gripper_state, dtype=np.float32).reshape(-1, 1)], axis=1
     )
@@ -284,6 +310,45 @@ def build_state_action(
 
     action = np.concatenate([task_action, gripper_cmd.reshape(-1, 1)], axis=1)
     return state.astype(np.float32), action.astype(np.float32), gripper_measured
+
+
+def validate_roi(region: Any, *, label: str = "ROI") -> tuple[float, float, float, float]:
+    """Validate a normalised `(x, y, width, height)` crop.
+
+    A crop may touch an image edge but may not be empty or extend beyond it.
+    This one check is shared by HTTP input, dataset export and rollout args so
+    the policy never sees a subtly different definition of the rectangle.
+    """
+    try:
+        x, y, width, height = (float(value) for value in region)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be [x, y, width, height]") from exc
+    if not all(np.isfinite((x, y, width, height))) or width <= 0 or height <= 0:
+        raise ValueError(f"{label} must have finite positive width and height")
+    if x < 0 or y < 0 or x + width > 1.0 + 1e-9 or y + height > 1.0 + 1e-9:
+        raise ValueError(f"{label} must stay within the normalised image [0, 1]")
+    return (x, y, width, height)
+
+
+def crop_image(frame: np.ndarray, roi: tuple[float, float, float, float] | None) -> np.ndarray:
+    """Crop an RGB camera frame using the normalised ROI used at export.
+
+    The lower bound is floored and the upper bound ceiled, so a valid crop is
+    never accidentally reduced to zero pixels on a small test image.
+    """
+    image = np.asarray(frame)
+    if roi is None:
+        return image
+    x, y, width, height = validate_roi(roi)
+    if image.ndim < 2:
+        raise ValueError(f"camera frame must have at least two dimensions, got {image.shape}")
+    rows, columns = image.shape[:2]
+    left, top = int(np.floor(x * columns)), int(np.floor(y * rows))
+    right = min(columns, int(np.ceil((x + width) * columns)))
+    bottom = min(rows, int(np.ceil((y + height) * rows)))
+    if right <= left or bottom <= top:
+        raise ValueError(f"ROI resolves to an empty crop for frame shape {image.shape}")
+    return image[top:bottom, left:right]
 
 
 def replay_targets_from_state_action(
@@ -314,8 +379,15 @@ def replay_targets_from_state_action(
     return np.asarray(targets, dtype=np.float32), np.asarray(gripper, dtype=np.float32)
 
 
-def decode_video(path: Path, count: int, resolution: tuple[int, int]) -> Iterator[np.ndarray]:
-    """Yield exactly `count` RGB frames, resized, in recording order.
+def decode_video(
+    path: Path,
+    count: int,
+    resolution: tuple[int, int],
+    *,
+    indices: np.ndarray | None = None,
+    roi: tuple[float, float, float, float] | None = None,
+) -> Iterator[np.ndarray]:
+    """Yield sampled RGB frames, cropped then resized, in recording order.
 
     By index, never by timestamp. The recorder writes one frame per control step
     so that video frame *i* is row *i*; the file's own timeline was built from
@@ -325,6 +397,9 @@ def decode_video(path: Path, count: int, resolution: tuple[int, int]) -> Iterato
     import av
 
     height, width = resolution
+    wanted = set(range(count)) if indices is None else set(np.asarray(indices, dtype=int).tolist())
+    if not wanted or min(wanted) < 0 or max(wanted) >= count:
+        raise ValueError("video sample indices must be within the recorded frame range")
     produced = 0
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
@@ -332,7 +407,15 @@ def decode_video(path: Path, count: int, resolution: tuple[int, int]) -> Iterato
         for frame in container.decode(stream):
             if produced >= count:
                 break
-            yield frame.reformat(width=width, height=height, format="rgb24").to_ndarray()
+            if produced in wanted:
+                rgb = frame.to_ndarray(format="rgb24")
+                cropped = crop_image(rgb, roi)
+                # `reformat` is intentionally after crop: resize the pixels the
+                # policy will observe, not the whole image and then a thumbnail.
+                import av
+                yield av.VideoFrame.from_ndarray(cropped, format="rgb24").reformat(
+                    width=width, height=height, format="rgb24"
+                ).to_ndarray()
             produced += 1
     if produced != count:
         raise ValueError(
@@ -364,9 +447,11 @@ def _screen(episode: Episode, config: ExportConfig, fps: int | None) -> str:
         if not (episode.path / f"{role}.mp4").is_file():
             return f"{role}.mp4 missing"
     if fps is not None:
-        rate = measured_fps(episode)
-        if abs(rate - fps) / fps > config.fps_tolerance:
-            return f"ran at {rate:.2f} Hz, dataset is {fps} Hz"
+        try:
+            _sample_stride(episode, fps, config.fps_tolerance)
+        except ValueError:
+            rate = measured_fps(episode)
+            return f"ran at {rate:.2f} Hz, cannot make a {fps} Hz integer frame grid"
     return ""
 
 
@@ -395,6 +480,28 @@ def resolve_fps(episodes: list[Episode], config: ExportConfig) -> int:
         raise ValueError("no episodes to measure a frame rate from")
     rates = [measured_fps(e) for e in episodes]
     return max(1, int(round(float(np.median(rates)))))
+
+
+def _sample_stride(episode: Episode, fps: int, tolerance: float) -> int:
+    """How many recorded 60 Hz-style steps form one dataset row.
+
+    We only permit integer strides.  Interpolating images would create pixels
+    that no camera observed; mixing actions from two moments would break the
+    state/action/video alignment.  A 60 Hz take to 30 Hz is therefore stride 2.
+    """
+    if fps < 1:
+        raise ValueError("dataset fps must be positive")
+    source = measured_fps(episode)
+    stride = max(1, int(round(source / fps)))
+    target_source_rate = fps * stride
+    if abs(source - target_source_rate) / target_source_rate > tolerance:
+        raise ValueError("source rate is not an integer multiple of dataset rate")
+    return stride
+
+
+def sample_indices(episode: Episode, fps: int, tolerance: float = 0.08) -> np.ndarray:
+    """The raw video/table rows that become one dataset episode."""
+    return np.arange(0, episode.meta.n_steps, _sample_stride(episode, fps, tolerance), dtype=np.int64)
 
 
 def _features(config: ExportConfig) -> dict[str, dict[str, Any]]:
@@ -464,9 +571,11 @@ def plan(
             configured_hz=float(episode.meta.control_hz),
         )
         if not reason:
+            indices = sample_indices(episode, fps, config.fps_tolerance)
             state, action, entry.gripper_measured = build_state_action(
-                episode, config.action_space, so_snake_config
+                episode, config.action_space, so_snake_config, indices
             )
+            entry.source_stride = _sample_stride(episode, fps, config.fps_tolerance)
             usable.append((episode, state, action))
             report.n_episodes += 1
             report.n_frames += len(state)
@@ -474,7 +583,7 @@ def plan(
 
     if usable:
         report.action_stats = _action_stats(np.concatenate([a for _, _, a in usable]))
-        report.replay_check = _replay_check(usable, config.action_space)
+        report.replay_check = _replay_check(usable, config.action_space, fps, config.fps_tolerance)
     return report, usable
 
 
@@ -543,9 +652,11 @@ def export(
             if should_continue is not None and not should_continue():
                 report.cancelled = True
                 break
+            indices = sample_indices(episode, fps, config.fps_tolerance)
             streams = {
                 role: decode_video(
-                    episode.path / f"{role}.mp4", len(state), config.resolution
+                    episode.path / f"{role}.mp4", episode.meta.n_steps, config.resolution,
+                    indices=indices, roi=config.roi.get(role),
                 )
                 for role in config.cameras
             }
@@ -605,6 +716,7 @@ def write_manifest(report: ExportReport, config: ExportConfig) -> Path:
         "action_space": report.action_space,
         "cameras": list(config.cameras),
         "resolution": list(config.resolution),
+        "roi": {role: list(region) for role, region in config.roi.items()},
         "task": config.task,
         "n_episodes": report.n_episodes,
         "n_frames": report.n_frames,
@@ -964,15 +1076,16 @@ def verify(
             unresolved.append(f"episode {index} ({source_id}): {exc}")
             continue
 
-        if len(state) != int(episode.meta.n_steps):
+        indices = sample_indices(episode, report.fps)
+        if len(state) != len(indices):
             report.issues.append(
                 f"episode {index} ({source_id}): {len(state)} rows on disk for "
-                f"{episode.meta.n_steps} recorded steps"
+                f"{len(indices)} expected exported steps"
             )
             continue
 
         expected_state, expected_action, _ = build_state_action(
-            episode, report.action_space, so_snake_config
+            episode, report.action_space, so_snake_config, indices
         )
         report.state_max_abs_error = max(
             report.state_max_abs_error,
@@ -987,7 +1100,7 @@ def verify(
         targets, gripper = replay_targets_from_state_action(
             state, action, report.action_space
         )
-        expected_targets = np.asarray(episode.task_target, dtype=float)
+        expected_targets = np.asarray(episode.task_target, dtype=float)[indices]
         diff = np.asarray(targets, dtype=float) - expected_targets
         for dim in _ANGULAR_DIMS:
             diff[:, dim] = wrap_to_pi(diff[:, dim])
@@ -1003,7 +1116,7 @@ def verify(
             float(
                 np.abs(
                     np.asarray(gripper, dtype=float)
-                    - np.asarray(episode.gripper_cmd_deg, dtype=float)
+                    - np.asarray(episode.gripper_cmd_deg, dtype=float)[indices]
                 ).max()
             ),
         )
@@ -1158,7 +1271,10 @@ def _action_stats(actions: np.ndarray) -> dict[str, Any]:
 
 
 def _replay_check(
-    usable: list[tuple[Episode, np.ndarray, np.ndarray]], action_space: str
+    usable: list[tuple[Episode, np.ndarray, np.ndarray]],
+    action_space: str,
+    fps: int,
+    tolerance: float,
 ) -> dict[str, Any]:
     """Can exported state/action reconstruct the demonstrations' targets?"""
     max_pos_m = 0.0
@@ -1167,7 +1283,8 @@ def _replay_check(
     n_frames = 0
     for episode, state, action in usable:
         targets, gripper = replay_targets_from_state_action(state, action, action_space)
-        expected = np.asarray(episode.task_target, dtype=float)
+        indices = sample_indices(episode, fps, tolerance)
+        expected = np.asarray(episode.task_target, dtype=float)[indices]
         diff = targets - expected
         for dim in _ANGULAR_DIMS:
             diff[:, dim] = wrap_to_pi(diff[:, dim])
@@ -1176,7 +1293,7 @@ def _replay_check(
             max_angle_rad = max(max_angle_rad, float(np.abs(diff[:, 3:5]).max()))
             max_gripper_deg = max(
                 max_gripper_deg,
-                float(np.abs(gripper - np.asarray(episode.gripper_cmd_deg, dtype=float)).max()),
+                float(np.abs(gripper - np.asarray(episode.gripper_cmd_deg, dtype=float)[indices]).max()),
             )
             n_frames += len(diff)
     return {
@@ -1202,9 +1319,9 @@ def format_report(report: ExportReport, config: ExportConfig) -> str:
 
     included = [e for e in report.episodes if e.included]
     if included:
-        drift = max(abs(e.measured_fps - report.fps) for e in included)
+        drift = max(abs(e.measured_fps / e.source_stride - report.fps) for e in included)
         lines.append(
-            f"  rate: takes ran {min(e.measured_fps for e in included):.2f}"
+            f"  rate: source takes ran {min(e.measured_fps for e in included):.2f}"
             f"-{max(e.measured_fps for e in included):.2f} Hz, "
             f"worst deviation from {report.fps} Hz is {drift / report.fps * 100:.1f}%"
         )
@@ -1243,7 +1360,7 @@ def format_report(report: ExportReport, config: ExportConfig) -> str:
         # not one bad take -- it is a whole second batch recorded at the new
         # rate. Saying so beats leaving the operator to notice that all the
         # rejects happen to share a date.
-        off_rate = [e for e in report.skipped if "dataset is" in e.reason]
+        off_rate = [e for e in report.skipped if "integer frame grid" in e.reason]
         if off_rate:
             rates = sorted({round(e.measured_fps) for e in off_rate})
             lines.append(

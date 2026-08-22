@@ -37,6 +37,7 @@ from so_snake.data.export import (
     format_verify,
     plan,
     verify,
+    validate_roi,
 )
 
 
@@ -64,8 +65,11 @@ def parse_args() -> argparse.Namespace:
                         help="frame size to resize to (default 240x320, which trains "
                              "at ~300 ms/step on an M1 Pro)")
     parser.add_argument("--fps", type=int, default=None,
-                        help="override the measured rate; doing so makes the rollout "
-                             "run at a different speed than the demonstrations")
+                        help="dataset frame rate. A lower integer divisor (e.g. 60 -> 30) "
+                             "samples state/action/video together; other rates are refused")
+    parser.add_argument("--roi", action="append", default=[], metavar="ROLE=X,Y,W,H",
+                        help="normalised image crop; repeat per camera, and it is recorded "
+                             "for matching rollout preprocessing")
     parser.add_argument("--include-aborted", action="store_true",
                         help="also export takes that ended for a reason other than "
                              "the operator stopping them")
@@ -122,6 +126,18 @@ def main() -> int:
         print(f"--resolution must look like HxW, got {args.resolution!r}", file=sys.stderr)
         return 2
 
+    roi = {}
+    for item in args.roi:
+        role, sep, values = item.partition("=")
+        if not sep or not role:
+            print(f"--roi must look like ROLE=X,Y,W,H, got {item!r}", file=sys.stderr)
+            return 2
+        try:
+            roi[role] = validate_roi(values.split(","), label=f"ROI for {role}")
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+
     config = ExportConfig(
         repo_id=args.repo_id,
         root=args.out,
@@ -131,6 +147,7 @@ def main() -> int:
         cameras=tuple(args.cameras) if args.cameras else ("third_person", "wrist"),
         resolution=(height, width),
         fps=args.fps,
+        roi=roi,
         include_aborted=args.include_aborted,
         episode_root=args.root,
     )
